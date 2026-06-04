@@ -30,7 +30,7 @@ class _NetworkSettingsState extends State<NetworkSettings> {
           settingsIndex: 'downloadThreads',
           interval: 1,
           min: 1,
-          max: 16,
+          max: 32,
         ).toSliver(),
       ],
     );

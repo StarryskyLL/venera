@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:isolate';
 
 import 'package:flutter/widgets.dart' show ChangeNotifier;
@@ -108,7 +109,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     if (path != null) {
       if (local == null) {
         Future.sync(() async {
-          var tasks = this.tasks.values.toList();
+          var tasks = _activeDownloads();
           for (var i = 0; i < tasks.length; i++) {
             if (!tasks[i].isComplete) {
               tasks[i].cancel();
@@ -123,7 +124,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         });
       } else if (chapters != null) {
         for (var c in chapters!) {
-          var dir = Directory(FilePath.join(path!, c));
+          var dir = Directory(
+            FilePath.join(path!, LocalManager.getChapterDirectoryName(c)),
+          );
           if (dir.existsSync()) {
             dir.deleteSync(recursive: true);
           }
@@ -146,22 +149,37 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     _isRunning = false;
     _message = "Paused";
     _currentSpeed = 0;
-    var shouldMove = <int>[];
-    for (var entry in tasks.entries) {
-      if (!entry.value.isComplete) {
-        entry.value.cancel();
-        shouldMove.add(entry.key);
-      }
-    }
-    for (var i in shouldMove) {
-      tasks.remove(i);
-    }
+    _cancelActiveDownloads();
     stopRecorder();
     notifyListeners();
   }
 
   @override
-  double get progress => _totalCount == 0 ? 0 : _downloadedCount / _totalCount;
+  double get progress {
+    if (comic?.chapters != null) {
+      var chapterIds = _downloadChapterIds;
+      if (chapterIds.isEmpty) {
+        return 0;
+      }
+      double completed = 0;
+      for (var chapterId in chapterIds) {
+        if (_completedChapters.contains(chapterId)) {
+          completed++;
+          continue;
+        }
+        var images = _images?[chapterId];
+        if (images == null || images.isEmpty) {
+          continue;
+        }
+        completed +=
+            ((_chapterDownloadedCounts[chapterId] ?? 0) / images.length)
+                .clamp(0, 1)
+                .toDouble();
+      }
+      return completed / chapterIds.length;
+    }
+    return _totalCount == 0 ? 0 : _downloadedCount / _totalCount;
+  }
 
   bool _isRunning = false;
 
@@ -186,10 +204,47 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   /// Current downloading chapter, index of [_images]
   int _chapter = 0;
 
+  /// Downloaded image count of each chapter.
+  final Map<String, int> _chapterDownloadedCounts = {};
+
+  /// Chapters that have finished downloading.
+  final Set<String> _completedChapters = {};
+
   var tasks = <int, _ImageDownloadWrapper>{};
 
-  int get _maxConcurrentTasks =>
-      (appdata.settings["downloadThreads"] as num).toInt();
+  final _chapterTasks = <String, _ImageDownloadWrapper>{};
+
+  int get _configuredDownloadThreads =>
+      ((appdata.settings["downloadThreads"] as num?)?.toInt() ?? 5)
+          .clamp(1, 32)
+          .toInt();
+
+  int get _maxConcurrentTasks => _configuredDownloadThreads;
+
+  int get _maxConcurrentChapters => _configuredDownloadThreads;
+
+  List<String> get _downloadChapterIds {
+    var ids = comic?.chapters?.ids.toList() ?? <String>[];
+    if (chapters == null) {
+      return ids;
+    }
+    var selectedChapters = chapters!.toSet();
+    return ids.where(selectedChapters.contains).toList();
+  }
+
+  List<_ImageDownloadWrapper> _activeDownloads() {
+    return [...tasks.values, ..._chapterTasks.values];
+  }
+
+  void _cancelActiveDownloads() {
+    for (var task in _activeDownloads()) {
+      if (!task.isComplete) {
+        task.cancel();
+      }
+    }
+    tasks.clear();
+    _chapterTasks.clear();
+  }
 
   void _scheduleTasks() {
     var images = _images![_images!.keys.elementAt(_chapter)]!;
@@ -237,6 +292,169 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       });
       downloading++;
     }
+  }
+
+  void _migrateLegacyChapterProgress(List<String> chapterIds) {
+    if (_chapterDownloadedCounts.isNotEmpty || _completedChapters.isNotEmpty) {
+      return;
+    }
+    if (_images == null || chapterIds.isEmpty) {
+      return;
+    }
+    for (var i = 0; i < chapterIds.length; i++) {
+      var chapterId = chapterIds[i];
+      var images = _images![chapterId];
+      if (images == null) {
+        continue;
+      }
+      if (i < _chapter) {
+        _chapterDownloadedCounts[chapterId] = images.length;
+        _completedChapters.add(chapterId);
+      } else if (i == _chapter) {
+        _chapterDownloadedCounts[chapterId] = _index
+            .clamp(0, images.length)
+            .toInt();
+      }
+    }
+  }
+
+  void _recalculateChapterCounts(List<String> chapterIds) {
+    _downloadedCount = 0;
+    _totalCount = 0;
+    for (var chapterId in chapterIds) {
+      var images = _images?[chapterId];
+      if (images == null) {
+        continue;
+      }
+      var downloaded = _completedChapters.contains(chapterId)
+          ? images.length
+          : (_chapterDownloadedCounts[chapterId] ?? 0)
+                .clamp(0, images.length)
+                .toInt();
+      _chapterDownloadedCounts[chapterId] = downloaded;
+      _downloadedCount += downloaded;
+      _totalCount += images.length;
+      if (downloaded >= images.length) {
+        _completedChapters.add(chapterId);
+      } else {
+        _completedChapters.remove(chapterId);
+      }
+    }
+  }
+
+  Future<bool> _ensureChapterImageList(
+    String chapterId,
+    int totalChapterCount,
+  ) async {
+    if (_images![chapterId] != null) {
+      return true;
+    }
+    _message = "Fetching image list (${_images!.length}/$totalChapterCount)...";
+    notifyListeners();
+    var res = await _runWithRetry(() async {
+      var r = await source.loadComicPages!(comicId, chapterId);
+      if (r.error) {
+        throw r.errorMessage!;
+      } else {
+        return r.data;
+      }
+    });
+    if (!_isRunning) {
+      return false;
+    }
+    if (res.error) {
+      Log.error("Download", res.errorMessage!);
+      _setError("Error: ${res.errorMessage}");
+      return false;
+    }
+    _images![chapterId] = res.data;
+    _chapterDownloadedCounts.putIfAbsent(chapterId, () => 0);
+    _recalculateChapterCounts(_downloadChapterIds);
+    _message = "$_downloadedCount/$_totalCount";
+    notifyListeners();
+    await LocalManager().saveCurrentDownloadingTasks();
+    return true;
+  }
+
+  Directory _chapterSaveDirectory(String chapterId) {
+    var saveTo = Directory(
+      FilePath.join(path!, LocalManager.getChapterDirectoryName(chapterId)),
+    );
+    if (!saveTo.existsSync()) {
+      saveTo.createSync(recursive: true);
+    }
+    return saveTo;
+  }
+
+  Future<bool> _downloadChapter(String chapterId, int totalChapterCount) async {
+    if (!await _ensureChapterImageList(chapterId, totalChapterCount)) {
+      return false;
+    }
+    var images = _images![chapterId]!;
+    var saveTo = _chapterSaveDirectory(chapterId);
+    var index = _chapterDownloadedCounts[chapterId] ?? 0;
+    while (_isRunning && index < images.length) {
+      var task = _ImageDownloadWrapper(
+        this,
+        chapterId,
+        images[index],
+        saveTo,
+        index,
+      );
+      _chapterTasks[chapterId] = task;
+      await task.wait();
+      if (_chapterTasks[chapterId] == task) {
+        _chapterTasks.remove(chapterId);
+      }
+      if (!_isRunning || task.isCancelled) {
+        return false;
+      }
+      if (task.error != null) {
+        Log.error("Download", task.error.toString());
+        _setError("Error: ${task.error}");
+        return false;
+      }
+      index++;
+      _chapterDownloadedCounts[chapterId] = index;
+      _downloadedCount++;
+      _message = "$_downloadedCount/$_totalCount";
+      notifyListeners();
+      await LocalManager().saveCurrentDownloadingTasks();
+    }
+    if (!_isRunning) {
+      return false;
+    }
+    _completedChapters.add(chapterId);
+    await LocalManager().saveCurrentDownloadingTasks();
+    notifyListeners();
+    return true;
+  }
+
+  Future<void> _downloadChaptersConcurrently() async {
+    _images ??= {};
+    var chapterIds = _downloadChapterIds;
+    _migrateLegacyChapterProgress(chapterIds);
+    _recalculateChapterCounts(chapterIds);
+    _message = "$_downloadedCount/$_totalCount";
+    notifyListeners();
+    await LocalManager().saveCurrentDownloadingTasks();
+    var pendingChapters = Queue<String>.from(
+      chapterIds.where((e) => !_completedChapters.contains(e)),
+    );
+    if (pendingChapters.isEmpty) {
+      return;
+    }
+    var workerCount = _maxConcurrentChapters
+        .clamp(1, pendingChapters.length)
+        .toInt();
+    Future<void> worker() async {
+      while (_isRunning && !_isError && pendingChapters.isNotEmpty) {
+        var chapterId = pendingChapters.removeFirst();
+        await _downloadChapter(chapterId, chapterIds.length);
+      }
+    }
+
+    await Future.wait(List.generate(workerCount, (_) => worker()));
   }
 
   @override
@@ -322,65 +540,37 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       await LocalManager().saveCurrentDownloadingTasks();
     }
 
+    if (comic!.chapters != null) {
+      await _downloadChaptersConcurrently();
+      if (!_isRunning || _isError) {
+        return;
+      }
+      LocalManager().completeTask(this);
+      stopRecorder();
+      return;
+    }
+
     if (_images == null) {
-      if (comic!.chapters == null) {
-        _message = "Fetching image list...";
-        notifyListeners();
-        var res = await _runWithRetry(() async {
-          var r = await source.loadComicPages!(comicId, null);
-          if (r.error) {
-            throw r.errorMessage!;
-          } else {
-            return r.data;
-          }
-        });
-        if (!_isRunning) {
-          return;
-        }
-        if (res.error) {
-          Log.error("Download", res.errorMessage!);
-          _setError("Error: ${res.errorMessage}");
-          return;
+      _message = "Fetching image list...";
+      notifyListeners();
+      var res = await _runWithRetry(() async {
+        var r = await source.loadComicPages!(comicId, null);
+        if (r.error) {
+          throw r.errorMessage!;
         } else {
-          _images = {'': res.data};
-          _totalCount = _images!['']!.length;
+          return r.data;
         }
+      });
+      if (!_isRunning) {
+        return;
+      }
+      if (res.error) {
+        Log.error("Download", res.errorMessage!);
+        _setError("Error: ${res.errorMessage}");
+        return;
       } else {
-        _images = {};
-        _totalCount = 0;
-        int cpCount = 0;
-        int totalCpCount =
-            chapters?.length ?? comic!.chapters!.allChapters.length;
-        for (var i in comic!.chapters!.allChapters.keys) {
-          if (chapters != null && !chapters!.contains(i)) {
-            continue;
-          }
-          if (_images![i] != null) {
-            _totalCount += _images![i]!.length;
-            continue;
-          }
-          _message = "Fetching image list ($cpCount/$totalCpCount)...";
-          notifyListeners();
-          var res = await _runWithRetry(() async {
-            var r = await source.loadComicPages!(comicId, i);
-            if (r.error) {
-              throw r.errorMessage!;
-            } else {
-              return r.data;
-            }
-          });
-          if (!_isRunning) {
-            return;
-          }
-          if (res.error) {
-            Log.error("Download", res.errorMessage!);
-            _setError("Error: ${res.errorMessage}");
-            return;
-          } else {
-            _images![i] = res.data;
-            _totalCount += _images![i]!.length;
-          }
-        }
+        _images = {'': res.data};
+        _totalCount = _images!['']!.length;
       }
       _message = "$_downloadedCount/$_totalCount";
       notifyListeners();
@@ -425,6 +615,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     _isRunning = false;
     _isError = true;
     _message = message;
+    _cancelActiveDownloads();
     notifyListeners();
     stopRecorder();
   }
@@ -450,6 +641,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       "totalCount": _totalCount,
       "index": _index,
       "chapter": _chapter,
+      "chapterDownloadedCounts": _chapterDownloadedCounts,
+      "completedChapters": _completedChapters.toList(),
     };
   }
 
@@ -463,6 +656,13 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       images = {};
       for (var entry in json["images"].entries) {
         images[entry.key] = List<String>.from(entry.value);
+      }
+    }
+
+    var chapterDownloadedCounts = <String, int>{};
+    if (json["chapterDownloadedCounts"] != null) {
+      for (var entry in json["chapterDownloadedCounts"].entries) {
+        chapterDownloadedCounts[entry.key] = (entry.value as num).toInt();
       }
     }
 
@@ -480,7 +680,11 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       .._downloadedCount = json["downloadedCount"]
       .._totalCount = json["totalCount"]
       .._index = json["index"]
-      .._chapter = json["chapter"];
+      .._chapter = json["chapter"]
+      .._chapterDownloadedCounts.addAll(chapterDownloadedCounts)
+      .._completedChapters.addAll(
+        List<String>.from(json["completedChapters"] ?? []),
+      );
   }
 
   @override
@@ -565,6 +769,12 @@ class _ImageDownloadWrapper {
 
   void cancel() {
     isCancelled = true;
+    for (var c in completers) {
+      if (!c.isCompleted) {
+        c.complete(this);
+      }
+    }
+    completers.clear();
   }
 
   var completers = <Completer<_ImageDownloadWrapper>>[];
@@ -616,7 +826,7 @@ class _ImageDownloadWrapper {
   }
 
   Future<_ImageDownloadWrapper> wait() {
-    if (isComplete) {
+    if (isComplete || isCancelled) {
       return Future.value(this);
     }
     var c = Completer<_ImageDownloadWrapper>();
