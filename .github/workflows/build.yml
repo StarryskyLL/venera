@@ -83,7 +83,7 @@ jobs:
 
   Build_Windows:
     if: ${{ inputs.build_windows }}
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
       - name: install dependencies
@@ -105,6 +105,7 @@ jobs:
         with:
           name: windows_build
           path: build/windows/Venera-*
+          if-no-files-found: error
 
   Build_MacOS:
     if: ${{ inputs.build_macos }}

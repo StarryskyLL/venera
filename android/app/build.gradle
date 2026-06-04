@@ -28,7 +28,11 @@ if (flutterVersionName == null) {
 def keystorePropertiesFile = rootProject.file("key.properties")
 def keystoreProperties = new Properties()
 keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
-def resolvedKeystoreFile = rootProject.file(keystoreProperties['storeFile'])
+def keystorePath = keystoreProperties['storeFile'] as String
+def resolvedKeystoreFile = rootProject.file(keystorePath)
+if (!resolvedKeystoreFile.exists() && keystorePath.startsWith("android/")) {
+    resolvedKeystoreFile = rootProject.file(keystorePath.substring("android/".length()))
+}
 
 android {
     namespace = "io.github.haukuen.venera"
