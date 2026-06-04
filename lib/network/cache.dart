@@ -79,6 +79,9 @@ class NetworkCacheManager implements Interceptor {
     RequestOptions options,
     RequestInterceptorHandler handler,
   ) async {
+    if (options.extra['skipMemoryCache'] == true) {
+      return handler.next(options);
+    }
     if (options.method != "GET") {
       return handler.next(options);
     }
@@ -190,6 +193,9 @@ class NetworkCacheManager implements Interceptor {
     Response<dynamic> response,
     ResponseInterceptorHandler handler,
   ) {
+    if (response.requestOptions.extra['skipMemoryCache'] == true) {
+      return handler.next(response);
+    }
     if (response.requestOptions.method != "GET") {
       return handler.next(response);
     }

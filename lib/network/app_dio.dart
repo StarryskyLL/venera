@@ -18,10 +18,12 @@ export 'package:dio/dio.dart';
 class MyLogInterceptor implements Interceptor {
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) {
-    Log.error(
-      "Network",
-      "${err.requestOptions.method} ${err.requestOptions.path}\n$err\n${err.response?.data.toString()}",
-    );
+    if (err.requestOptions.extra['skipLog'] != true) {
+      Log.error(
+        "Network",
+        "${err.requestOptions.method} ${err.requestOptions.path}\n$err\n${err.response?.data.toString()}",
+      );
+    }
     switch (err.type) {
       case DioExceptionType.badResponse:
         var statusCode = err.response?.statusCode;
@@ -83,6 +85,10 @@ class MyLogInterceptor implements Interceptor {
     Response<dynamic> response,
     ResponseInterceptorHandler handler,
   ) {
+    if (response.requestOptions.extra['skipLog'] == true) {
+      handler.next(response);
+      return;
+    }
     var headers = response.headers.map.map(
       (key, value) => MapEntry(
         key.toLowerCase(),
@@ -113,6 +119,13 @@ class MyLogInterceptor implements Interceptor {
 
   @override
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    if (options.extra['skipLog'] == true) {
+      options.connectTimeout = const Duration(seconds: 15);
+      options.receiveTimeout = const Duration(seconds: 15);
+      options.sendTimeout = const Duration(seconds: 15);
+      handler.next(options);
+      return;
+    }
     const String headerMask = "********";
     const String dataMask = "****** DATA_PROTECTED ******";
     Log.info(

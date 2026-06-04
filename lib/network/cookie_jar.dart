@@ -253,10 +253,13 @@ class CookieManagerSql extends Interceptor {
 
   @override
   void onResponse(Response response, ResponseInterceptorHandler handler) {
-    cookieJar.saveFromResponseCookieHeader(
-      response.requestOptions.uri,
-      response.headers["set-cookie"] ?? [],
-    );
+    var cookies = response.headers["set-cookie"];
+    if (cookies != null && cookies.isNotEmpty) {
+      cookieJar.saveFromResponseCookieHeader(
+        response.requestOptions.uri,
+        cookies,
+      );
+    }
     handler.next(response);
   }
 

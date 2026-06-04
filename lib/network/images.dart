@@ -1,11 +1,12 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter_qjs/flutter_qjs.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/consts.dart';
+import 'package:venera/utils/file_type.dart';
 import 'package:venera/utils/image.dart';
+import 'package:venera/utils/io.dart';
 
 import 'app_dio.dart';
 
@@ -134,6 +135,180 @@ abstract class ImageDownloader {
     String eid,
   ) {
     return _loadComicImage(imageKey, sourceKey, cid, eid);
+  }
+
+  static Stream<ImageDownloadProgress> downloadComicImageToFile(
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid,
+    Directory saveTo,
+    int index,
+  ) async* {
+    final tempFile = saveTo.joinFile(".$index.downloading");
+    var isFinished = false;
+
+    Future<Map<String, dynamic>?> Function()? onLoadFailed;
+    var configs = <String, dynamic>{};
+    if (sourceKey != null) {
+      var comicSource = ComicSource.find(sourceKey);
+      configs =
+          (await comicSource!.getImageLoadingConfig?.call(
+            imageKey,
+            cid,
+            eid,
+          )) ??
+          {};
+    }
+    var retryLimit = 5;
+    try {
+      while (true) {
+        try {
+          configs['headers'] ??= {'user-agent': webUA};
+
+          if (configs['onLoadFailed'] is JSInvokable) {
+            onLoadFailed = () async {
+              dynamic result = (configs['onLoadFailed'] as JSInvokable)([]);
+              if (result is Future) {
+                result = await result;
+              }
+              if (result is! Map<String, dynamic>) return null;
+              return result;
+            };
+          }
+
+          var dio = AppDio(
+            BaseOptions(
+              headers: Map<String, dynamic>.from(configs['headers']),
+              method: configs['method'] ?? 'GET',
+              responseType: ResponseType.stream,
+            ),
+          );
+
+          var req = await dio.request<ResponseBody>(
+            configs['url'] ?? imageKey,
+            data: configs['data'],
+            options: Options(
+              method: configs['method'] ?? 'GET',
+              responseType: ResponseType.stream,
+              extra: {'skipLog': true, 'skipMemoryCache': true},
+            ),
+          );
+          var stream =
+              req.data?.stream ?? (throw "Error: Empty response body.");
+          int? expectedBytes = req.data!.contentLength;
+          if (expectedBytes == -1) {
+            expectedBytes = null;
+          }
+
+          var needsProcessing =
+              configs['onResponse'] is JSInvokable ||
+              configs['modifyImage'] != null;
+          var downloaded = 0;
+          List<int>? buffer;
+          IOSink? sink;
+          if (needsProcessing) {
+            buffer = <int>[];
+          } else {
+            await tempFile.parent.create(recursive: true);
+            sink = tempFile.openWrite();
+          }
+
+          try {
+            await for (var data in stream) {
+              downloaded += data.length;
+              if (buffer != null) {
+                buffer.addAll(data);
+              } else {
+                sink!.add(data);
+              }
+              yield ImageDownloadProgress(
+                currentBytes: downloaded,
+                totalBytes: expectedBytes,
+              );
+            }
+          } finally {
+            await sink?.close();
+          }
+
+          late Uint8List imageBytes;
+          if (buffer != null) {
+            if (configs['onResponse'] is JSInvokable) {
+              try {
+                dynamic result = (configs['onResponse'] as JSInvokable)([
+                  Uint8List.fromList(buffer),
+                ]);
+                if (result is Future) {
+                  result = await result;
+                }
+                if (result is List<int>) {
+                  buffer = result;
+                } else {
+                  throw "Error: Invalid onResponse result.";
+                }
+              } finally {
+                (configs['onResponse'] as JSInvokable).free();
+              }
+            }
+
+            imageBytes = buffer is Uint8List
+                ? buffer
+                : Uint8List.fromList(buffer);
+            if (configs['modifyImage'] != null) {
+              imageBytes = await modifyImageWithScript(
+                imageBytes,
+                configs['modifyImage'],
+              );
+            }
+            await tempFile.writeAsBytes(imageBytes);
+          } else {
+            imageBytes = await tempFile
+                .openRead(0, 64)
+                .fold<BytesBuilder>(BytesBuilder(copy: false), (builder, data) {
+                  builder.add(data);
+                  return builder;
+                })
+                .then((builder) => builder.takeBytes());
+          }
+
+          var fileType = detectFileType(imageBytes);
+          var resultFile = saveTo.joinFile("$index${fileType.ext}");
+          if (await resultFile.exists()) {
+            await resultFile.delete();
+          }
+          await tempFile.rename(resultFile.path);
+          isFinished = true;
+          yield ImageDownloadProgress(
+            currentBytes: downloaded,
+            totalBytes: downloaded,
+            imageBytes: imageBytes,
+          );
+          return;
+        } catch (e) {
+          await tempFile.deleteIgnoreError();
+          if (retryLimit < 0 || onLoadFailed == null) {
+            rethrow;
+          }
+          var newConfig = await onLoadFailed();
+          (configs['onLoadFailed'] as JSInvokable).free();
+          onLoadFailed = null;
+          if (newConfig == null) {
+            rethrow;
+          }
+          configs = newConfig;
+          retryLimit--;
+        } finally {
+          if (onLoadFailed != null) {
+            (configs['onLoadFailed'] as JSInvokable).free();
+            onLoadFailed = null;
+          }
+        }
+      }
+    } finally {
+      if (!isFinished) {
+        await tempFile.deleteIgnoreError();
+      }
+    }
   }
 
   static Stream<ImageDownloadProgress> _loadComicImage(

@@ -1089,11 +1089,13 @@ class _ImageDownloadWrapper {
   void start() async {
     int lastBytes = 0;
     try {
-      await for (var p in ImageDownloader.loadComicImageUnwrapped(
+      await for (var p in ImageDownloader.downloadComicImageToFile(
         image,
         task.source.key,
         task.comicId,
         chapter,
+        saveTo,
+        index,
       )) {
         if (isCancelled) {
           return;
@@ -1101,9 +1103,6 @@ class _ImageDownloadWrapper {
         task.onData(p.currentBytes - lastBytes);
         lastBytes = p.currentBytes;
         if (p.imageBytes != null) {
-          var fileType = detectFileType(p.imageBytes!);
-          var file = saveTo.joinFile("$index${fileType.ext}");
-          await file.writeAsBytes(p.imageBytes!);
           isComplete = true;
           for (var c in completers) {
             c.complete(this);
