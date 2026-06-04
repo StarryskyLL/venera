@@ -210,9 +210,16 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   /// Chapters that have finished downloading.
   final Set<String> _completedChapters = {};
 
+  /// Chapters that are currently handled by chapter workers.
+  final Set<String> _activeChapters = {};
+
   var tasks = <int, _ImageDownloadWrapper>{};
 
   final _chapterTasks = <String, _ImageDownloadWrapper>{};
+
+  DateTime _lastDownloadingTaskSave = DateTime.fromMillisecondsSinceEpoch(0);
+
+  Future<void> _downloadingTaskSave = Future.value();
 
   int get _configuredDownloadThreads =>
       ((appdata.settings["downloadThreads"] as num?)?.toInt() ?? 5)
@@ -232,6 +239,30 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     return ids.where(selectedChapters.contains).toList();
   }
 
+  String _chapterProgressMessage([List<String>? chapterIds]) {
+    chapterIds ??= _downloadChapterIds;
+    var completed = chapterIds.where(_completedChapters.contains).length;
+    var running = _activeChapters.where(chapterIds.contains).length;
+    if (running == 0) {
+      return "$completed/${chapterIds.length} chapters";
+    }
+    return "$completed/${chapterIds.length} chapters ($running running)";
+  }
+
+  Future<void> _saveCurrentDownloadingTasksState({bool force = false}) async {
+    var now = DateTime.now();
+    if (!force &&
+        now.difference(_lastDownloadingTaskSave) < const Duration(seconds: 1)) {
+      return;
+    }
+    _lastDownloadingTaskSave = now;
+    var save = _downloadingTaskSave.then((_) {
+      return LocalManager().saveCurrentDownloadingTasks();
+    });
+    _downloadingTaskSave = save.catchError((_) {});
+    await save;
+  }
+
   List<_ImageDownloadWrapper> _activeDownloads() {
     return [...tasks.values, ..._chapterTasks.values];
   }
@@ -244,6 +275,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
     tasks.clear();
     _chapterTasks.clear();
+    _activeChapters.clear();
   }
 
   void _scheduleTasks() {
@@ -370,9 +402,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     _images![chapterId] = res.data;
     _chapterDownloadedCounts.putIfAbsent(chapterId, () => 0);
     _recalculateChapterCounts(_downloadChapterIds);
-    _message = "$_downloadedCount/$_totalCount";
+    _message = _chapterProgressMessage();
     notifyListeners();
-    await LocalManager().saveCurrentDownloadingTasks();
+    await _saveCurrentDownloadingTasksState();
     return true;
   }
 
@@ -387,47 +419,60 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   }
 
   Future<bool> _downloadChapter(String chapterId, int totalChapterCount) async {
-    if (!await _ensureChapterImageList(chapterId, totalChapterCount)) {
-      return false;
-    }
-    var images = _images![chapterId]!;
-    var saveTo = _chapterSaveDirectory(chapterId);
-    var index = _chapterDownloadedCounts[chapterId] ?? 0;
-    while (_isRunning && index < images.length) {
-      var task = _ImageDownloadWrapper(
-        this,
-        chapterId,
-        images[index],
-        saveTo,
-        index,
-      );
-      _chapterTasks[chapterId] = task;
-      await task.wait();
-      if (_chapterTasks[chapterId] == task) {
-        _chapterTasks.remove(chapterId);
-      }
-      if (!_isRunning || task.isCancelled) {
-        return false;
-      }
-      if (task.error != null) {
-        Log.error("Download", task.error.toString());
-        _setError("Error: ${task.error}");
-        return false;
-      }
-      index++;
-      _chapterDownloadedCounts[chapterId] = index;
-      _downloadedCount++;
-      _message = "$_downloadedCount/$_totalCount";
-      notifyListeners();
-      await LocalManager().saveCurrentDownloadingTasks();
-    }
-    if (!_isRunning) {
-      return false;
-    }
-    _completedChapters.add(chapterId);
-    await LocalManager().saveCurrentDownloadingTasks();
+    _activeChapters.add(chapterId);
+    _message = _chapterProgressMessage();
     notifyListeners();
-    return true;
+    try {
+      if (!await _ensureChapterImageList(chapterId, totalChapterCount)) {
+        return false;
+      }
+      var images = _images![chapterId]!;
+      var saveTo = _chapterSaveDirectory(chapterId);
+      var index = _chapterDownloadedCounts[chapterId] ?? 0;
+      while (_isRunning && index < images.length) {
+        var task = _ImageDownloadWrapper(
+          this,
+          chapterId,
+          images[index],
+          saveTo,
+          index,
+        );
+        _chapterTasks[chapterId] = task;
+        await task.wait();
+        if (_chapterTasks[chapterId] == task) {
+          _chapterTasks.remove(chapterId);
+        }
+        if (!_isRunning || task.isCancelled) {
+          return false;
+        }
+        if (task.error != null) {
+          Log.error("Download", task.error.toString());
+          _setError("Error: ${task.error}");
+          return false;
+        }
+        index++;
+        _chapterDownloadedCounts[chapterId] = index;
+        _downloadedCount++;
+        _message = _chapterProgressMessage();
+        notifyListeners();
+        await _saveCurrentDownloadingTasksState();
+      }
+      if (!_isRunning) {
+        return false;
+      }
+      _completedChapters.add(chapterId);
+      _recalculateChapterCounts(_downloadChapterIds);
+      _message = _chapterProgressMessage();
+      await _saveCurrentDownloadingTasksState(force: true);
+      notifyListeners();
+      return true;
+    } finally {
+      _activeChapters.remove(chapterId);
+      if (_isRunning && !_isError) {
+        _message = _chapterProgressMessage();
+        notifyListeners();
+      }
+    }
   }
 
   Future<void> _downloadChaptersConcurrently() async {
@@ -435,9 +480,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     var chapterIds = _downloadChapterIds;
     _migrateLegacyChapterProgress(chapterIds);
     _recalculateChapterCounts(chapterIds);
-    _message = "$_downloadedCount/$_totalCount";
+    _message = _chapterProgressMessage(chapterIds);
     notifyListeners();
-    await LocalManager().saveCurrentDownloadingTasks();
+    await _saveCurrentDownloadingTasksState(force: true);
     var pendingChapters = Queue<String>.from(
       chapterIds.where((e) => !_completedChapters.contains(e)),
     );
