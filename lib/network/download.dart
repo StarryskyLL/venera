@@ -19,6 +19,43 @@ import 'package:zip_flutter/zip_flutter.dart';
 
 import 'file_downloader.dart';
 
+class DownloadChapterProgress {
+  const DownloadChapterProgress({
+    required this.id,
+    required this.title,
+    required this.downloaded,
+    required this.total,
+    required this.isCompleted,
+    required this.isRunning,
+    required this.hasImageList,
+  });
+
+  final String id;
+
+  final String title;
+
+  final int downloaded;
+
+  final int? total;
+
+  final bool isCompleted;
+
+  final bool isRunning;
+
+  final bool hasImageList;
+
+  double? get progress {
+    var imageCount = total;
+    if (imageCount == null) {
+      return null;
+    }
+    if (imageCount == 0) {
+      return isCompleted ? 1.0 : 0.0;
+    }
+    return downloaded.clamp(0, imageCount).toDouble() / imageCount;
+  }
+}
+
 abstract class DownloadTask with ChangeNotifier {
   /// 0-1
   double get progress;
@@ -41,6 +78,8 @@ abstract class DownloadTask with ChangeNotifier {
   String? get cover;
 
   String get message;
+
+  List<DownloadChapterProgress> get chapterProgresses => const [];
 
   /// root path for the comic. If null, the task is not scheduled.
   String? path;
@@ -237,6 +276,30 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
     var selectedChapters = chapters!.toSet();
     return ids.where(selectedChapters.contains).toList();
+  }
+
+  @override
+  List<DownloadChapterProgress> get chapterProgresses {
+    var chapters = comic?.chapters;
+    if (chapters == null) {
+      return const [];
+    }
+    return [
+      for (var chapterId in _downloadChapterIds)
+        DownloadChapterProgress(
+          id: chapterId,
+          title: chapters[chapterId] ?? chapterId,
+          downloaded: _completedChapters.contains(chapterId)
+              ? (_images?[chapterId]?.length ??
+                    _chapterDownloadedCounts[chapterId] ??
+                    0)
+              : (_chapterDownloadedCounts[chapterId] ?? 0),
+          total: _images?[chapterId]?.length,
+          isCompleted: _completedChapters.contains(chapterId),
+          isRunning: _activeChapters.contains(chapterId),
+          hasImageList: _images?[chapterId] != null,
+        ),
+    ];
   }
 
   String _chapterProgressMessage([List<String>? chapterIds]) {

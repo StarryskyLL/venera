@@ -168,7 +168,8 @@ class _DownloadTaskTileState extends State<_DownloadTaskTile> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    var hasDetails = widget.task.chapterProgresses.isNotEmpty;
+    var child = Container(
       height: 136,
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
       child: Row(
@@ -221,6 +222,11 @@ class _DownloadTaskTileState extends State<_DownloadTaskTile> {
                         ),
                       ],
                     ),
+                    if (hasDetails)
+                      Icon(
+                        Icons.chevron_right,
+                        color: context.colorScheme.onSurfaceVariant,
+                      ),
                   ],
                 ),
                 const Spacer(),
@@ -232,6 +238,246 @@ class _DownloadTaskTileState extends State<_DownloadTaskTile> {
               ],
             ),
           ),
+        ],
+      ),
+    );
+    if (!hasDetails) {
+      return child;
+    }
+    return InkWell(
+      onTap: () {
+        context.to(() => _DownloadChapterProgressPage(task: widget.task));
+      },
+      child: child,
+    );
+  }
+}
+
+class _DownloadChapterProgressPage extends StatefulWidget {
+  const _DownloadChapterProgressPage({required this.task});
+
+  final DownloadTask task;
+
+  @override
+  State<_DownloadChapterProgressPage> createState() =>
+      _DownloadChapterProgressPageState();
+}
+
+class _DownloadChapterProgressPageState
+    extends State<_DownloadChapterProgressPage> {
+  late DownloadTask task;
+
+  @override
+  void initState() {
+    super.initState();
+    task = widget.task;
+    task.addListener(update);
+  }
+
+  @override
+  void dispose() {
+    task.removeListener(update);
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _DownloadChapterProgressPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.task != widget.task) {
+      task.removeListener(update);
+      task = widget.task;
+      task.addListener(update);
+    }
+  }
+
+  void update() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    var chapters = task.chapterProgresses;
+    var isFirstTask = LocalManager().downloadingTasks.firstOrNull == task;
+    return Scaffold(
+      body: SmoothCustomScrollView(
+        slivers: [
+          SliverAppbar(
+            style: AppbarStyle.shadow,
+            title: Text(task.title),
+            actions: [
+              if (isFirstTask)
+                if (task.isPaused || task.isError)
+                  Tooltip(
+                    message: "Start".tl,
+                    child: IconButton(
+                      icon: const Icon(Icons.play_arrow),
+                      onPressed: task.resume,
+                    ),
+                  )
+                else
+                  Tooltip(
+                    message: "Pause".tl,
+                    child: IconButton(
+                      icon: const Icon(Icons.pause),
+                      onPressed: task.pause,
+                    ),
+                  ),
+            ],
+          ),
+          SliverToBoxAdapter(child: _DownloadChapterProgressHeader(task: task)),
+          if (chapters.isEmpty)
+            SliverFillRemaining(
+              hasScrollBody: false,
+              child: Center(child: Text("Chapters".tl)),
+            )
+          else
+            SliverList(
+              delegate: SliverChildBuilderDelegate((context, index) {
+                return _DownloadChapterProgressTile(
+                  progress: chapters[index],
+                  task: task,
+                );
+              }, childCount: chapters.length),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DownloadChapterProgressHeader extends StatelessWidget {
+  const _DownloadChapterProgressHeader({required this.task});
+
+  final DownloadTask task;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(
+            color: context.colorScheme.outlineVariant,
+            width: 0.6,
+          ),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  task.message,
+                  style: ts.s14.withColor(context.colorScheme.onSurfaceVariant),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                task.isPaused || task.isError
+                    ? (task.isError ? "Error".tl : "Paused".tl)
+                    : "${bytesToReadableString(task.speed)}/s",
+                style: ts.s14.bold,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          LinearProgressIndicator(value: task.progress),
+        ],
+      ),
+    );
+  }
+}
+
+class _DownloadChapterProgressTile extends StatelessWidget {
+  const _DownloadChapterProgressTile({
+    required this.progress,
+    required this.task,
+  });
+
+  final DownloadChapterProgress progress;
+
+  final DownloadTask task;
+
+  String get statusText {
+    if (progress.isCompleted) {
+      return "Completed".tl;
+    }
+    if (task.isError) {
+      return "Error".tl;
+    }
+    if (task.isPaused) {
+      return "Paused".tl;
+    }
+    if (progress.isRunning && !progress.hasImageList) {
+      return "Fetching image list...".tl;
+    }
+    if (progress.isRunning) {
+      return "Downloading".tl;
+    }
+    return "Waiting".tl;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    var total = progress.total;
+    var countText = total == null
+        ? "${progress.downloaded}/?"
+        : "${progress.downloaded}/$total";
+    var progressValue = progress.isRunning && !progress.hasImageList
+        ? null
+        : progress.isCompleted
+        ? 1.0
+        : progress.progress ?? 0.0;
+    var statusColor = progress.isCompleted
+        ? context.colorScheme.primary
+        : progress.isRunning
+        ? context.colorScheme.tertiary
+        : context.colorScheme.onSurfaceVariant;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(
+            color: context.colorScheme.outlineVariant,
+            width: 0.6,
+          ),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            progress.title,
+            style: ts.s16.bold,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  statusText,
+                  style: ts.s12.withColor(statusColor),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                countText,
+                style: ts.s14.withColor(context.colorScheme.onSurfaceVariant),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          LinearProgressIndicator(value: progressValue),
         ],
       ),
     );
