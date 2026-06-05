@@ -484,6 +484,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
     _message = "Fetching image list (${_images!.length}/$totalChapterCount)...";
     notifyListeners();
+    var loadPagesWatch = Stopwatch()..start();
     var res = await _runWithRetry(() async {
       var r = await source.loadComicPages!(comicId, chapterId);
       if (r.error) {
@@ -492,6 +493,15 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         return r.data;
       }
     });
+    loadPagesWatch.stop();
+    if (loadPagesWatch.elapsedMilliseconds >= 800 || res.error) {
+      Log.info(
+        "DownloadTiming",
+        "chapterImages source=${source.key} cid=$comicId eid=$chapterId "
+            "elapsed=${loadPagesWatch.elapsedMilliseconds}ms "
+            "images=${res.dataOrNull?.length ?? -1} error=${res.error}",
+      );
+    }
     if (!_isRunning) {
       return false;
     }

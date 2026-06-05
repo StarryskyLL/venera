@@ -4,13 +4,136 @@ import 'package:flutter_qjs/flutter_qjs.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/consts.dart';
+import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/file_type.dart';
 import 'package:venera/utils/image.dart';
 import 'package:venera/utils/io.dart';
 
 import 'app_dio.dart';
 
+const _downloadTimingMaxLogs = 80;
+var _downloadTimingLogs = 0;
+
+String _safeDownloadHost(String url) {
+  try {
+    return Uri.parse(url).host;
+  } catch (_) {
+    return '';
+  }
+}
+
+void _logSlowImageDownloadTiming({
+  required String imageKey,
+  required String? sourceKey,
+  required String cid,
+  required String eid,
+  required int index,
+  required int bytes,
+  required bool needsProcessing,
+  required bool hasOnResponse,
+  required bool hasModifyImage,
+  required int totalMs,
+  required int configMs,
+  required int? requestMs,
+  required int? firstChunkMs,
+  required int? streamMs,
+  required int? closeMs,
+  required int? processMs,
+  required int? detectMs,
+  required int? renameMs,
+  bool usedDirectClient = false,
+  Object? error,
+}) {
+  var slow =
+      totalMs >= 1200 ||
+      configMs >= 500 ||
+      (requestMs ?? 0) >= 800 ||
+      (firstChunkMs ?? 0) >= 800 ||
+      (streamMs ?? 0) >= 800 ||
+      (processMs ?? 0) >= 500 ||
+      (renameMs ?? 0) >= 300 ||
+      error != null;
+  if (!slow || _downloadTimingLogs >= _downloadTimingMaxLogs) {
+    return;
+  }
+  _downloadTimingLogs++;
+  var status = error == null ? "ok" : "error=${error.toString()}";
+  Log.info(
+    "DownloadTiming",
+    "image $status source=$sourceKey cid=$cid eid=$eid index=$index "
+        "host=${_safeDownloadHost(imageKey)} bytes=$bytes "
+        "direct=$usedDirectClient processed=$needsProcessing onResponse=$hasOnResponse "
+        "modifyImage=$hasModifyImage total=${totalMs}ms "
+        "config=${configMs}ms request=${requestMs ?? -1}ms "
+        "firstChunk=${firstChunkMs ?? -1}ms stream=${streamMs ?? -1}ms "
+        "close=${closeMs ?? -1}ms process=${processMs ?? -1}ms "
+        "detect=${detectMs ?? -1}ms rename=${renameMs ?? -1}ms",
+  );
+}
+
+String _normalizeImageDownloadUrl(String url) {
+  if (url.startsWith('//')) {
+    return 'https:$url';
+  }
+  return url;
+}
+
+bool _isHttpImageDownloadUrl(String url) {
+  var uri = Uri.tryParse(url);
+  return uri != null && (uri.scheme == 'http' || uri.scheme == 'https');
+}
+
+bool _canUseDirectImageDownload(Map<String, dynamic> configs, String url) {
+  var method = (configs['method'] ?? 'GET').toString().toUpperCase();
+  var headers = configs['headers'];
+  var preventParallel = headers is Map && headers['prevent-parallel'] == 'true';
+  return method == 'GET' &&
+      configs['data'] == null &&
+      configs['onLoadFailed'] is! JSInvokable &&
+      configs['onResponse'] is! JSInvokable &&
+      configs['modifyImage'] == null &&
+      !preventParallel &&
+      _isHttpImageDownloadUrl(url);
+}
+
+Future<Response<ResponseBody>> _requestImageDownload({
+  required String url,
+  required Map<String, dynamic> configs,
+  required bool useDirectClient,
+}) {
+  if (useDirectClient) {
+    return ImageDownloader._directDownloadDio.request<ResponseBody>(
+      url,
+      options: Options(
+        method: 'GET',
+        headers: Map<String, dynamic>.from(configs['headers']),
+        responseType: ResponseType.stream,
+      ),
+    );
+  }
+  var dio = AppDio(
+    BaseOptions(
+      headers: Map<String, dynamic>.from(configs['headers']),
+      method: configs['method'] ?? 'GET',
+      responseType: ResponseType.stream,
+    ),
+  );
+  return dio.request<ResponseBody>(
+    url,
+    data: configs['data'],
+    options: Options(
+      method: configs['method'] ?? 'GET',
+      responseType: ResponseType.stream,
+      extra: {'skipLog': true, 'skipMemoryCache': true},
+    ),
+  );
+}
+
 abstract class ImageDownloader {
+  static final Dio _directDownloadDio = Dio(
+    BaseOptions(responseType: ResponseType.stream),
+  )..httpClientAdapter = RHttpAdapter();
+
   static Stream<ImageDownloadProgress> loadThumbnail(
     String url,
     String? sourceKey, [
@@ -145,6 +268,8 @@ abstract class ImageDownloader {
     Directory saveTo,
     int index,
   ) async* {
+    final totalWatch = Stopwatch()..start();
+    final configWatch = Stopwatch()..start();
     final tempFile = saveTo.joinFile(".$index.downloading");
     var isFinished = false;
 
@@ -160,6 +285,19 @@ abstract class ImageDownloader {
           )) ??
           {};
     }
+    configWatch.stop();
+    int? requestMs;
+    int? firstChunkMs;
+    int? streamMs;
+    int? closeMs;
+    int? processMs;
+    int? detectMs;
+    int? renameMs;
+    var lastDownloadedBytes = 0;
+    var needsProcessingForLog = false;
+    var hasOnResponseForLog = false;
+    var hasModifyImageForLog = false;
+    var usedDirectClientForLog = false;
     var retryLimit = 5;
     try {
       while (true) {
@@ -177,23 +315,33 @@ abstract class ImageDownloader {
             };
           }
 
-          var dio = AppDio(
-            BaseOptions(
-              headers: Map<String, dynamic>.from(configs['headers']),
-              method: configs['method'] ?? 'GET',
-              responseType: ResponseType.stream,
-            ),
+          var requestUrl = _normalizeImageDownloadUrl(
+            (configs['url'] ?? imageKey).toString(),
           );
+          var useDirectClient = _canUseDirectImageDownload(configs, requestUrl);
+          usedDirectClientForLog = useDirectClient;
 
-          var req = await dio.request<ResponseBody>(
-            configs['url'] ?? imageKey,
-            data: configs['data'],
-            options: Options(
-              method: configs['method'] ?? 'GET',
-              responseType: ResponseType.stream,
-              extra: {'skipLog': true, 'skipMemoryCache': true},
-            ),
-          );
+          var requestWatch = Stopwatch()..start();
+          late Response<ResponseBody> req;
+          try {
+            req = await _requestImageDownload(
+              url: requestUrl,
+              configs: configs,
+              useDirectClient: useDirectClient,
+            );
+          } catch (_) {
+            if (!useDirectClient) {
+              rethrow;
+            }
+            usedDirectClientForLog = false;
+            req = await _requestImageDownload(
+              url: requestUrl,
+              configs: configs,
+              useDirectClient: false,
+            );
+          }
+          requestWatch.stop();
+          requestMs = requestWatch.elapsedMilliseconds;
           var stream =
               req.data?.stream ?? (throw "Error: Empty response body.");
           int? expectedBytes = req.data!.contentLength;
@@ -204,6 +352,9 @@ abstract class ImageDownloader {
           var needsProcessing =
               configs['onResponse'] is JSInvokable ||
               configs['modifyImage'] != null;
+          needsProcessingForLog = needsProcessing;
+          hasOnResponseForLog = configs['onResponse'] is JSInvokable;
+          hasModifyImageForLog = configs['modifyImage'] != null;
           var downloaded = 0;
           List<int>? buffer;
           IOSink? sink;
@@ -215,8 +366,12 @@ abstract class ImageDownloader {
           }
 
           try {
+            var streamWatch = Stopwatch()..start();
+            var firstChunkWatch = Stopwatch()..start();
             await for (var data in stream) {
+              firstChunkMs ??= firstChunkWatch.elapsedMilliseconds;
               downloaded += data.length;
+              lastDownloadedBytes = downloaded;
               if (buffer != null) {
                 buffer.addAll(data);
               } else {
@@ -227,11 +382,17 @@ abstract class ImageDownloader {
                 totalBytes: expectedBytes,
               );
             }
+            streamWatch.stop();
+            streamMs = streamWatch.elapsedMilliseconds;
           } finally {
+            var closeWatch = Stopwatch()..start();
             await sink?.close();
+            closeWatch.stop();
+            closeMs = closeWatch.elapsedMilliseconds;
           }
 
           late Uint8List imageBytes;
+          var processWatch = Stopwatch()..start();
           if (buffer != null) {
             if (configs['onResponse'] is JSInvokable) {
               try {
@@ -270,18 +431,47 @@ abstract class ImageDownloader {
                 })
                 .then((builder) => builder.takeBytes());
           }
+          processWatch.stop();
+          processMs = processWatch.elapsedMilliseconds;
 
+          var detectWatch = Stopwatch()..start();
           var fileType = detectFileType(imageBytes);
+          detectWatch.stop();
+          detectMs = detectWatch.elapsedMilliseconds;
           var resultFile = saveTo.joinFile("$index${fileType.ext}");
           if (await resultFile.exists()) {
             await resultFile.delete();
           }
+          var renameWatch = Stopwatch()..start();
           await tempFile.rename(resultFile.path);
+          renameWatch.stop();
+          renameMs = renameWatch.elapsedMilliseconds;
           isFinished = true;
           yield ImageDownloadProgress(
             currentBytes: downloaded,
             totalBytes: downloaded,
             imageBytes: imageBytes,
+          );
+          _logSlowImageDownloadTiming(
+            imageKey: configs['url'] ?? imageKey,
+            sourceKey: sourceKey,
+            cid: cid,
+            eid: eid,
+            index: index,
+            bytes: downloaded,
+            needsProcessing: needsProcessingForLog,
+            hasOnResponse: hasOnResponseForLog,
+            hasModifyImage: hasModifyImageForLog,
+            totalMs: totalWatch.elapsedMilliseconds,
+            configMs: configWatch.elapsedMilliseconds,
+            requestMs: requestMs,
+            firstChunkMs: firstChunkMs,
+            streamMs: streamMs,
+            closeMs: closeMs,
+            processMs: processMs,
+            detectMs: detectMs,
+            renameMs: renameMs,
+            usedDirectClient: usedDirectClientForLog,
           );
           return;
         } catch (e) {
@@ -304,6 +494,30 @@ abstract class ImageDownloader {
           }
         }
       }
+    } catch (e) {
+      _logSlowImageDownloadTiming(
+        imageKey: configs['url'] ?? imageKey,
+        sourceKey: sourceKey,
+        cid: cid,
+        eid: eid,
+        index: index,
+        bytes: lastDownloadedBytes,
+        needsProcessing: needsProcessingForLog,
+        hasOnResponse: hasOnResponseForLog,
+        hasModifyImage: hasModifyImageForLog,
+        totalMs: totalWatch.elapsedMilliseconds,
+        configMs: configWatch.elapsedMilliseconds,
+        requestMs: requestMs,
+        firstChunkMs: firstChunkMs,
+        streamMs: streamMs,
+        closeMs: closeMs,
+        processMs: processMs,
+        detectMs: detectMs,
+        renameMs: renameMs,
+        usedDirectClient: usedDirectClientForLog,
+        error: e,
+      );
+      rethrow;
     } finally {
       if (!isFinished) {
         await tempFile.deleteIgnoreError();
