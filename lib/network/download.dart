@@ -264,10 +264,6 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   Future<void> _downloadingTaskSave = Future.value();
 
-  Completer<void>? _chapterDownloadWake;
-
-  int _chapterDownloadWakeVersion = 0;
-
   int get _configuredDownloadThreads =>
       ((appdata.settings["downloadThreads"] as num?)?.toInt() ?? 5)
           .clamp(1, 32)
@@ -315,12 +311,12 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   String _chapterProgressMessage([List<String>? chapterIds]) {
     chapterIds ??= _downloadChapterIds;
     var completed = chapterIds.where(_completedChapters.contains).length;
-    var downloading = _activeChapterImageDownloadCount;
+    var downloading = _activeChapters.length;
     if (downloading == 0) {
       return "$completed/${chapterIds.length} chapters";
     }
     return "$completed/${chapterIds.length} chapters "
-        "($downloading images downloading)";
+        "($downloading chapters downloading)";
   }
 
   Future<void> _saveCurrentDownloadingTasksState({bool force = false}) async {
@@ -344,22 +340,6 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     ];
   }
 
-  int get _activeChapterImageDownloadCount {
-    var count = 0;
-    for (var chapterTasks in _chapterTasks.values) {
-      count += chapterTasks.values.where((task) => !task.isComplete).length;
-    }
-    return count;
-  }
-
-  void _wakeChapterDownloadScheduler() {
-    _chapterDownloadWakeVersion++;
-    var wake = _chapterDownloadWake;
-    if (wake != null && !wake.isCompleted) {
-      wake.complete();
-    }
-  }
-
   void _cancelActiveDownloads() {
     for (var task in _activeDownloads()) {
       if (!task.isComplete) {
@@ -369,7 +349,6 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     tasks.clear();
     _chapterTasks.clear();
     _activeChapters.clear();
-    _wakeChapterDownloadScheduler();
   }
 
   void _scheduleTasks() {
@@ -551,82 +530,86 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     return downloaded.length + active.length < images.length;
   }
 
-  bool _startNextChapterImageDownload(String chapterId) {
-    var images = _images![chapterId]!;
-    var downloaded = _chapterDownloadedIndexes.putIfAbsent(chapterId, () => {});
-    var active = _chapterTasks.putIfAbsent(chapterId, () => {});
-    for (var index = 0; index < images.length; index++) {
-      if (downloaded.contains(index) || active.containsKey(index)) {
-        continue;
-      }
-      var task = _ImageDownloadWrapper(
-        this,
-        chapterId,
-        images[index],
-        _chapterSaveDirectory(chapterId),
-        index,
-      );
-      active[index] = task;
-      _activeChapters.add(chapterId);
-      task.wait().then((task) {
-        _handleChapterImageDownloadFinished(chapterId, index, task);
-      });
-      return true;
-    }
-    return false;
-  }
-
-  Future<void> _handleChapterImageDownloadFinished(
+  Future<void> _downloadChapterSerially(
     String chapterId,
-    int index,
-    _ImageDownloadWrapper task,
+    int totalChapterCount,
   ) async {
-    if (_chapterTasks[chapterId]?[index] == task) {
-      _chapterTasks[chapterId]!.remove(index);
-      if (_chapterTasks[chapterId]!.isEmpty) {
-        _chapterTasks.remove(chapterId);
-      }
-    }
-    if (!_isRunning || task.isCancelled) {
-      _wakeChapterDownloadScheduler();
-      return;
-    }
-    if (task.error != null) {
-      Log.error("Download", task.error.toString());
-      _setError("Error: ${task.error}");
-      _wakeChapterDownloadScheduler();
-      return;
-    }
-    var downloaded = _chapterDownloadedIndexes.putIfAbsent(chapterId, () => {});
-    if (downloaded.add(index)) {
-      _downloadedCount++;
-    }
-    _chapterDownloadedCounts[chapterId] = downloaded.length;
-    var images = _images?[chapterId];
-    var forceSave = false;
-    if (images != null && downloaded.length >= images.length) {
-      _completedChapters.add(chapterId);
-      _activeChapters.remove(chapterId);
-      _chapterDownloadedCounts[chapterId] = images.length;
-      forceSave = true;
-    }
-    _recalculateChapterCounts(_downloadChapterIds);
+    _activeChapters.add(chapterId);
     _message = _chapterProgressMessage();
     notifyListeners();
-    _wakeChapterDownloadScheduler();
-    await _saveCurrentDownloadingTasksState(force: forceSave);
+    try {
+      var success = await _ensureChapterImageList(chapterId, totalChapterCount);
+      if (!success || !_isRunning || _isError) {
+        return;
+      }
+
+      var images = _images![chapterId]!;
+      var downloaded = _chapterDownloadedIndexes.putIfAbsent(chapterId, () => {});
+      var saveTo = _chapterSaveDirectory(chapterId);
+      for (var index = 0; index < images.length; index++) {
+        if (!_isRunning || _isError) {
+          return;
+        }
+        if (downloaded.contains(index)) {
+          continue;
+        }
+        var task = _ImageDownloadWrapper(
+          this,
+          chapterId,
+          images[index],
+          saveTo,
+          index,
+        );
+        _chapterTasks[chapterId] = {index: task};
+        task = await task.wait();
+        _chapterTasks.remove(chapterId);
+        if (!_isRunning || task.isCancelled) {
+          return;
+        }
+        if (task.error != null) {
+          Log.error("Download", task.error.toString());
+          _setError("Error: ${task.error}");
+          return;
+        }
+        downloaded.add(index);
+        _chapterDownloadedCounts[chapterId] = downloaded.length;
+        _recalculateChapterCounts(_downloadChapterIds);
+        _message = _chapterProgressMessage();
+        notifyListeners();
+        await _saveCurrentDownloadingTasksState();
+      }
+
+      _completedChapters.add(chapterId);
+      _chapterDownloadedCounts[chapterId] = images.length;
+      _recalculateChapterCounts(_downloadChapterIds);
+      _message = _chapterProgressMessage();
+      notifyListeners();
+      await _saveCurrentDownloadingTasksState(force: true);
+    } finally {
+      _chapterTasks.remove(chapterId);
+      _activeChapters.remove(chapterId);
+      if (_isRunning && !_isError) {
+        _message = _chapterProgressMessage();
+        notifyListeners();
+      }
+    }
   }
 
-  Future<void> _waitForChapterDownloadWake(int wakeVersion) async {
-    if (_chapterDownloadWakeVersion != wakeVersion) {
-      return;
+  Future<void> _downloadChapterWorker(
+    Queue<String> pendingChapters,
+    int totalChapterCount,
+  ) async {
+    while (_isRunning && !_isError && pendingChapters.isNotEmpty) {
+      var chapterId = pendingChapters.removeFirst();
+      if (_completedChapters.contains(chapterId)) {
+        continue;
+      }
+      if (!_hasPendingChapterImages(chapterId)) {
+        _completedChapters.add(chapterId);
+        continue;
+      }
+      await _downloadChapterSerially(chapterId, totalChapterCount);
     }
-    _chapterDownloadWake = Completer<void>();
-    if (_chapterDownloadWakeVersion != wakeVersion) {
-      _chapterDownloadWake!.complete();
-    }
-    await _chapterDownloadWake!.future;
-    _chapterDownloadWake = null;
   }
 
   Future<void> _downloadChaptersConcurrently() async {
@@ -637,107 +620,24 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     _message = _chapterProgressMessage(chapterIds);
     notifyListeners();
     await _saveCurrentDownloadingTasksState(force: true);
-    var readyChapters = Queue<String>.from(
-      chapterIds.where(
-        (chapterId) =>
-            !_completedChapters.contains(chapterId) &&
-            _images![chapterId] != null &&
-            _hasPendingChapterImages(chapterId),
-      ),
-    );
     var pendingChapters = Queue<String>.from(
       chapterIds.where(
         (chapterId) =>
             !_completedChapters.contains(chapterId) &&
-            _images![chapterId] == null,
+            _hasPendingChapterImages(chapterId),
       ),
     );
-    if (pendingChapters.isEmpty && readyChapters.isEmpty) {
+    if (pendingChapters.isEmpty) {
       return;
     }
-    var fetchingChapters = <String>{};
-
-    void addReadyChapter(String chapterId) {
-      if (!readyChapters.contains(chapterId)) {
-        readyChapters.add(chapterId);
-      }
-    }
-
-    void startFetchingChapters() {
-      while (_isRunning &&
-          !_isError &&
-          pendingChapters.isNotEmpty &&
-          fetchingChapters.length < _maxConcurrentChapters) {
-        var chapterId = pendingChapters.removeFirst();
-        fetchingChapters.add(chapterId);
-        _activeChapters.add(chapterId);
-        _message = _chapterProgressMessage(chapterIds);
-        notifyListeners();
-        _ensureChapterImageList(chapterId, chapterIds.length).then((success) {
-          fetchingChapters.remove(chapterId);
-          if (!_isRunning || _isError) {
-            _wakeChapterDownloadScheduler();
-            return;
-          }
-          if (success) {
-            if (_completedChapters.contains(chapterId)) {
-              _activeChapters.remove(chapterId);
-            } else if (_hasPendingChapterImages(chapterId) &&
-                !readyChapters.contains(chapterId)) {
-              addReadyChapter(chapterId);
-            }
-          } else if (!_hasPendingChapterImages(chapterId)) {
-            _activeChapters.remove(chapterId);
-          }
-          _message = _chapterProgressMessage(chapterIds);
-          notifyListeners();
-          _wakeChapterDownloadScheduler();
-        });
-      }
-    }
-
-    startFetchingChapters();
-    while (_isRunning &&
-        !_isError &&
-        (pendingChapters.isNotEmpty ||
-            fetchingChapters.isNotEmpty ||
-            readyChapters.isNotEmpty ||
-            _activeChapterImageDownloadCount > 0)) {
-      startFetchingChapters();
-      var started = false;
-      while (_isRunning &&
-          !_isError &&
-          readyChapters.isNotEmpty &&
-          _activeChapterImageDownloadCount < _maxConcurrentTasks) {
-        var chapterId = readyChapters.removeFirst();
-        if (_completedChapters.contains(chapterId)) {
-          _activeChapters.remove(chapterId);
-          continue;
-        }
-        if (_startNextChapterImageDownload(chapterId)) {
-          started = true;
-          if (_hasPendingChapterImages(chapterId)) {
-            addReadyChapter(chapterId);
-          }
-        } else if (!_hasPendingChapterImages(chapterId)) {
-          _activeChapters.remove(chapterId);
-        }
-      }
-      if (started) {
-        _message = _chapterProgressMessage(chapterIds);
-        notifyListeners();
-        continue;
-      }
-      if (readyChapters.isNotEmpty &&
-          _activeChapterImageDownloadCount < _maxConcurrentTasks) {
-        continue;
-      }
-      if (pendingChapters.isNotEmpty &&
-          fetchingChapters.length < _maxConcurrentChapters) {
-        continue;
-      }
-      await _waitForChapterDownloadWake(_chapterDownloadWakeVersion);
-    }
+    var workerCount = _maxConcurrentChapters
+        .clamp(1, pendingChapters.length)
+        .toInt();
+    var workers = [
+      for (var i = 0; i < workerCount; i++)
+        _downloadChapterWorker(pendingChapters, chapterIds.length),
+    ];
+    await Future.wait(workers);
     _activeChapters.clear();
     _chapterTasks.clear();
     if (!_isRunning || _isError) {
