@@ -544,7 +544,10 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }
 
       var images = _images![chapterId]!;
-      var downloaded = _chapterDownloadedIndexes.putIfAbsent(chapterId, () => {});
+      var downloaded = _chapterDownloadedIndexes.putIfAbsent(
+        chapterId,
+        () => {},
+      );
       var saveTo = _chapterSaveDirectory(chapterId);
       for (var index = 0; index < images.length; index++) {
         if (!_isRunning || _isError) {
