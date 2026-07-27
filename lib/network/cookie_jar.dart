@@ -10,6 +10,8 @@ import 'package:venera/utils/ext.dart';
 class CookieJarSql {
   late Database _db;
 
+  final Map<String, List<Cookie>> _domainCache = {};
+
   final String path;
 
   CookieJarSql(this.path) {
@@ -33,6 +35,7 @@ class CookieJarSql {
   }
 
   void saveFromResponse(Uri uri, List<Cookie> cookies) {
+    if (cookies.isEmpty) return;
     var current = loadForRequest(uri);
     for (var cookie in cookies) {
       var currentCookie = current.firstWhereOrNull(
@@ -58,10 +61,15 @@ class CookieJarSql {
           cookie.httpOnly ? 1 : 0,
         ],
       );
+      _domainCache.remove(cookie.domain ?? uri.host);
     }
   }
 
   List<Cookie> _loadWithDomain(String domain) {
+    final cached = _domainCache[domain];
+    if (cached != null) {
+      return cached.map(_copyCookie).toList(growable: false);
+    }
     var rows = _db.select(
       '''
       SELECT name, value, domain, path, expires, secure, httpOnly
@@ -71,7 +79,7 @@ class CookieJarSql {
       [domain],
     );
 
-    return rows
+    final cookies = rows
         .map(
           (row) => Cookie(row["name"] as String, row["value"] as String)
             ..domain = row["domain"] as String
@@ -83,6 +91,17 @@ class CookieJarSql {
             ..httpOnly = row["httpOnly"] == 1,
         )
         .toList();
+    _domainCache[domain] = cookies;
+    return cookies.map(_copyCookie).toList(growable: false);
+  }
+
+  Cookie _copyCookie(Cookie cookie) {
+    return Cookie(cookie.name, cookie.value)
+      ..domain = cookie.domain
+      ..path = cookie.path
+      ..expires = cookie.expires
+      ..secure = cookie.secure
+      ..httpOnly = cookie.httpOnly;
   }
 
   List<String> _getAcceptedDomains(String host) {
@@ -116,6 +135,7 @@ class CookieJarSql {
       ''',
         [cookie.name, cookie.domain, cookie.path],
       );
+      _domainCache.remove(cookie.domain);
     }
 
     return cookies
@@ -147,6 +167,7 @@ class CookieJarSql {
   }
 
   void saveFromResponseCookieHeader(Uri uri, List<String> cookieHeader) {
+    if (cookieHeader.isEmpty) return;
     var cookies = <Cookie>[];
     for (var header in cookieHeader) {
       try {
@@ -189,6 +210,7 @@ class CookieJarSql {
       ''',
         [name, domain, uri.path],
       );
+      _domainCache.remove(domain);
     }
   }
 
@@ -202,6 +224,7 @@ class CookieJarSql {
       ''',
         [domain],
       );
+      _domainCache.remove(domain);
     }
   }
 
@@ -209,6 +232,7 @@ class CookieJarSql {
     _db.execute('''
       DELETE FROM cookies;
     ''');
+    _domainCache.clear();
   }
 
   void dispose() {

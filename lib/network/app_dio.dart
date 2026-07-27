@@ -83,6 +83,10 @@ class MyLogInterceptor implements Interceptor {
     Response<dynamic> response,
     ResponseInterceptorHandler handler,
   ) {
+    if (response.requestOptions.extra['skipNetworkLog'] == true) {
+      handler.next(response);
+      return;
+    }
     var headers = response.headers.map.map(
       (key, value) => MapEntry(
         key.toLowerCase(),
@@ -113,6 +117,13 @@ class MyLogInterceptor implements Interceptor {
 
   @override
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    options.connectTimeout = const Duration(seconds: 15);
+    options.receiveTimeout = const Duration(seconds: 15);
+    options.sendTimeout = const Duration(seconds: 15);
+    if (options.extra['skipNetworkLog'] == true) {
+      handler.next(options);
+      return;
+    }
     const String headerMask = "********";
     const String dataMask = "****** DATA_PROTECTED ******";
     Log.info(
@@ -121,9 +132,6 @@ class MyLogInterceptor implements Interceptor {
           "headers:\n${options.extra.containsKey("maskHeadersInLog") ? options.headers.map((key, value) => MapEntry(key, options.extra["maskHeadersInLog"].contains(key) ? headerMask : value)) : options.headers}\n"
           "data:\n${options.extra["maskDataInLog"] == true ? dataMask : options.data}",
     );
-    options.connectTimeout = const Duration(seconds: 15);
-    options.receiveTimeout = const Duration(seconds: 15);
-    options.sendTimeout = const Duration(seconds: 15);
     handler.next(options);
   }
 }
@@ -134,7 +142,9 @@ class AppDio with DioMixin {
     httpClientAdapter = RHttpAdapter();
     if (App.isInitialized) {
       interceptors.add(CookieManagerSql(SingleInstanceCookieJar.instance!));
-      interceptors.add(NetworkCacheManager());
+      if (this.options.extra['skipNetworkCache'] != true) {
+        interceptors.add(NetworkCacheManager());
+      }
       interceptors.add(CloudflareInterceptor());
       interceptors.add(MyLogInterceptor());
     }

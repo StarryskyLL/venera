@@ -8,6 +8,7 @@ import 'package:venera/foundation/consts.dart';
 import 'package:venera/utils/image.dart';
 
 import 'app_dio.dart';
+import 'comic_image_file_writer.dart';
 
 abstract class ImageDownloader {
   static Stream<ImageDownloadProgress> loadThumbnail(
@@ -133,7 +134,9 @@ abstract class ImageDownloader {
     String cid,
     String eid, {
     bool cacheResult = true,
+    bool readCache = true,
     String? connectionPoolKey,
+    String? savePathWithoutExtension,
   }) {
     return _loadComicImage(
       imageKey,
@@ -141,7 +144,9 @@ abstract class ImageDownloader {
       cid,
       eid,
       cacheResult: cacheResult,
+      readCache: readCache,
       connectionPoolKey: connectionPoolKey,
+      savePathWithoutExtension: savePathWithoutExtension,
     );
   }
 
@@ -151,17 +156,22 @@ abstract class ImageDownloader {
     String cid,
     String eid, {
     bool cacheResult = true,
+    bool readCache = true,
     String? connectionPoolKey,
+    String? savePathWithoutExtension,
   }) async* {
     final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
-    final cache = await CacheManager().findCache(cacheKey);
+    final cache = readCache ? await CacheManager().findCache(cacheKey) : null;
 
     if (cache != null) {
       var data = await cache.readAsBytes();
+      if (savePathWithoutExtension != null) {
+        await ComicImageFileWriter.writeBytes(savePathWithoutExtension, data);
+      }
       yield ImageDownloadProgress(
         currentBytes: data.length,
         totalBytes: data.length,
-        imageBytes: data,
+        imageBytes: savePathWithoutExtension == null ? data : null,
       );
       return;
     }
@@ -201,6 +211,8 @@ abstract class ImageDownloader {
             method: configs['method'] ?? 'GET',
             responseType: ResponseType.stream,
             extra: {
+              'skipNetworkCache': true,
+              'skipNetworkLog': true,
               if (connectionPoolKey != null)
                 'connectionPoolKey': connectionPoolKey,
             },
@@ -216,6 +228,25 @@ abstract class ImageDownloader {
         if (expectedBytes == -1) {
           expectedBytes = null;
         }
+
+        final requiresBuffer =
+            savePathWithoutExtension == null ||
+            cacheResult ||
+            configs['onResponse'] is JSInvokable ||
+            configs['modifyImage'] != null;
+        if (!requiresBuffer) {
+          await for (final currentBytes in ComicImageFileWriter.writeStream(
+            stream,
+            savePathWithoutExtension,
+          )) {
+            yield ImageDownloadProgress(
+              currentBytes: currentBytes,
+              totalBytes: expectedBytes,
+            );
+          }
+          return;
+        }
+
         final buffer = BytesBuilder(copy: false);
         var currentBytes = 0;
         await for (var data in stream) {
@@ -253,10 +284,13 @@ abstract class ImageDownloader {
         if (cacheResult) {
           await CacheManager().writeCache(cacheKey, data);
         }
+        if (savePathWithoutExtension != null) {
+          await ComicImageFileWriter.writeBytes(savePathWithoutExtension, data);
+        }
         yield ImageDownloadProgress(
           currentBytes: data.length,
           totalBytes: data.length,
-          imageBytes: data,
+          imageBytes: savePathWithoutExtension == null ? data : null,
         );
         return;
       } catch (e) {

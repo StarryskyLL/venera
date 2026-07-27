@@ -310,7 +310,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   }
 
   void _scheduleProgressSave() {
-    _progressSaveTimer ??= Timer(const Duration(seconds: 1), () {
+    _progressSaveTimer ??= Timer(const Duration(seconds: 5), () {
       _progressSaveTimer = null;
       unawaited(LocalManager().saveCurrentDownloadingTasks());
     });
@@ -863,21 +863,19 @@ class _ImageDownloadWrapper {
         task.comicId,
         chapter,
         cacheResult: false,
+        readCache: false,
         connectionPoolKey: connectionPoolKey,
+        savePathWithoutExtension: FilePath.join(saveTo.path, index.toString()),
       )) {
         if (isCancelled) {
           return;
         }
         task.onData(p.currentBytes - lastBytes);
         lastBytes = p.currentBytes;
-        if (p.imageBytes != null) {
-          var fileType = detectFileType(p.imageBytes!);
-          var file = saveTo.joinFile("$index${fileType.ext}");
-          await file.writeAsBytes(p.imageBytes!);
-          isComplete = true;
-          _completeWaiters();
-        }
       }
+      if (isCancelled) return;
+      isComplete = true;
+      _completeWaiters();
     } catch (e, s) {
       if (isCancelled) {
         return;

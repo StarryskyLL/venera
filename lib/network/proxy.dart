@@ -9,15 +9,26 @@ String? _cachedProxy;
 
 DateTime? _cachedProxyTime;
 
+Future<String?>? _proxyRequest;
+
 Future<String?> getProxy() async {
   if (_cachedProxyTime != null &&
       DateTime.now().difference(_cachedProxyTime!).inSeconds < 1) {
     return _cachedProxy;
   }
-  String? proxy = await _getProxy();
-  _cachedProxy = proxy;
-  _cachedProxyTime = DateTime.now();
-  return proxy;
+  final request = _proxyRequest ??= _getProxy();
+  try {
+    final proxy = await request;
+    if (identical(_proxyRequest, request)) {
+      _cachedProxy = proxy;
+      _cachedProxyTime = DateTime.now();
+    }
+    return proxy;
+  } finally {
+    if (identical(_proxyRequest, request)) {
+      _proxyRequest = null;
+    }
+  }
 }
 
 Future<String?> _getProxy() async {
