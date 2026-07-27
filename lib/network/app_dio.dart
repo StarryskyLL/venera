@@ -182,25 +182,66 @@ class RHttpAdapter implements HttpClientAdapter {
 
   RHttpAdapter({this.enableProxy = true});
 
-  Future<rhttp.ClientSettings> get settings async {
-    var proxy = enableProxy ? await getProxy() : null;
+  // AppDio instances are short-lived, while each client owns a connection pool.
+  static final Map<String, Future<rhttp.RhttpClient>> _clients = {};
 
-    return rhttp.ClientSettings(
-      proxySettings: proxy == null
-          ? const rhttp.ProxySettings.noProxy()
-          : rhttp.ProxySettings.proxy(proxy),
-      redirectSettings: const rhttp.RedirectSettings.limited(5),
-      timeoutSettings: const rhttp.TimeoutSettings(
-        connectTimeout: Duration(seconds: 15),
-        keepAliveTimeout: Duration(seconds: 60),
-        keepAlivePing: Duration(seconds: 30),
+  Future<_RHttpClientConfig> _getClientConfig({String? poolKey}) async {
+    final proxy = enableProxy ? await getProxy() : null;
+    final overrides = _getOverrides();
+    final sni = appdata.settings['sni'] != false;
+    final verifyCertificates = appdata.settings['ignoreBadCertificate'] != true;
+
+    final overrideKeys = overrides.keys.toList()..sort();
+    final key = jsonEncode({
+      'proxy': proxy,
+      'dns': {for (final key in overrideKeys) key: overrides[key]},
+      'sni': sni,
+      'verifyCertificates': verifyCertificates,
+      'poolKey': poolKey,
+    });
+
+    return _RHttpClientConfig(
+      key,
+      rhttp.ClientSettings(
+        proxySettings: proxy == null
+            ? const rhttp.ProxySettings.noProxy()
+            : rhttp.ProxySettings.proxy(proxy),
+        redirectSettings: const rhttp.RedirectSettings.limited(5),
+        timeoutSettings: const rhttp.TimeoutSettings(
+          connectTimeout: Duration(seconds: 15),
+          keepAliveTimeout: Duration(seconds: 60),
+          keepAlivePing: Duration(seconds: 30),
+        ),
+        throwOnStatusCode: false,
+        dnsSettings: rhttp.DnsSettings.static(overrides: overrides),
+        tlsSettings: rhttp.TlsSettings(
+          sni: sni,
+          verifyCertificates: verifyCertificates,
+        ),
       ),
-      throwOnStatusCode: false,
-      dnsSettings: rhttp.DnsSettings.static(overrides: _getOverrides()),
-      tlsSettings: rhttp.TlsSettings(
-        sni: appdata.settings['sni'] != false,
-        verifyCertificates: appdata.settings['ignoreBadCertificate'] != true,
-      ),
+    );
+  }
+
+  Future<rhttp.ClientSettings> get settings async {
+    return (await _getClientConfig()).settings;
+  }
+
+  static Future<rhttp.RhttpClient> _createClient(
+    String key,
+    rhttp.ClientSettings settings,
+  ) async {
+    try {
+      return await rhttp.RhttpClient.create(settings: settings);
+    } catch (_) {
+      _clients.remove(key);
+      rethrow;
+    }
+  }
+
+  static Future<rhttp.RhttpClient> _getClient(_RHttpClientConfig config) {
+    return _clients.putIfAbsent(
+      config.key,
+      () => _createClient(config.key, config.settings),
     );
   }
 
@@ -234,10 +275,13 @@ class RHttpAdapter implements HttpClientAdapter {
       options.headers['User-Agent'] = "venera/v${App.version}";
     }
 
-    var res = await rhttp.Rhttp.request(
+    final config = await _getClientConfig(
+      poolKey: options.extra['connectionPoolKey'] as String?,
+    );
+    final client = await _getClient(config);
+    var res = await client.request(
       method: rhttp.HttpMethod(options.method),
       url: options.uri.toString(),
-      settings: await settings,
       expectBody: rhttp.HttpExpectBody.stream,
       body: requestStream == null ? null : rhttp.HttpBody.stream(requestStream),
       headers: rhttp.HttpHeaders.rawMap(
@@ -285,4 +329,11 @@ class RHttpAdapter implements HttpClientAdapter {
       _ => "Invalid Status Code $statusCode",
     };
   }
+}
+
+class _RHttpClientConfig {
+  const _RHttpClientConfig(this.key, this.settings);
+
+  final String key;
+  final rhttp.ClientSettings settings;
 }

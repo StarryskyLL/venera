@@ -392,7 +392,10 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         ? pendingCount
         : _maxConcurrentTasks;
     final Future<void> workers = Future.wait(
-      List.generate(workerCount, (_) => _chapterWorker(queue, runId)),
+      List.generate(
+        workerCount,
+        (workerIndex) => _chapterWorker(queue, runId, workerIndex),
+      ),
     ).then((_) {});
     _chapterWorkers = workers;
     await workers;
@@ -403,12 +406,16 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         _chapterIds.every(_completedChapters.contains);
   }
 
-  Future<void> _chapterWorker(ChapterDownloadQueue queue, int runId) async {
+  Future<void> _chapterWorker(
+    ChapterDownloadQueue queue,
+    int runId,
+    int workerIndex,
+  ) async {
     while (_isCurrentRun(runId)) {
       final chapterId = queue.takeNext();
       if (chapterId == null) return;
       try {
-        await _downloadChapter(chapterId, runId);
+        await _downloadChapter(chapterId, runId, workerIndex);
       } catch (e, s) {
         if (_isCurrentRun(runId)) {
           _chapterStates[chapterId] = ChapterDownloadStatus.error;
@@ -421,7 +428,11 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
   }
 
-  Future<void> _downloadChapter(String chapterId, int runId) async {
+  Future<void> _downloadChapter(
+    String chapterId,
+    int runId,
+    int workerIndex,
+  ) async {
     var images = _images![chapterId];
     _chapterErrors.remove(chapterId);
     _chapterStates[chapterId] = images == null
@@ -469,6 +480,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         images[index],
         saveTo,
         index,
+        connectionPoolKey: 'download-worker-$workerIndex',
       );
       tasks[chapterId] = task;
       await task.wait();
@@ -814,13 +826,16 @@ class _ImageDownloadWrapper {
 
   final Directory saveTo;
 
+  final String? connectionPoolKey;
+
   _ImageDownloadWrapper(
     this.task,
     this.chapter,
     this.image,
     this.saveTo,
-    this.index,
-  ) {
+    this.index, {
+    this.connectionPoolKey,
+  }) {
     start();
   }
 
@@ -847,6 +862,8 @@ class _ImageDownloadWrapper {
         task.source.key,
         task.comicId,
         chapter,
+        cacheResult: false,
+        connectionPoolKey: connectionPoolKey,
       )) {
         if (isCancelled) {
           return;

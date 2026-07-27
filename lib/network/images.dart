@@ -131,17 +131,28 @@ abstract class ImageDownloader {
     String imageKey,
     String? sourceKey,
     String cid,
-    String eid,
-  ) {
-    return _loadComicImage(imageKey, sourceKey, cid, eid);
+    String eid, {
+    bool cacheResult = true,
+    String? connectionPoolKey,
+  }) {
+    return _loadComicImage(
+      imageKey,
+      sourceKey,
+      cid,
+      eid,
+      cacheResult: cacheResult,
+      connectionPoolKey: connectionPoolKey,
+    );
   }
 
   static Stream<ImageDownloadProgress> _loadComicImage(
     String imageKey,
     String? sourceKey,
     String cid,
-    String eid,
-  ) async* {
+    String eid, {
+    bool cacheResult = true,
+    String? connectionPoolKey,
+  }) async* {
     final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
     final cache = await CacheManager().findCache(cacheKey);
 
@@ -189,6 +200,10 @@ abstract class ImageDownloader {
             headers: configs['headers'],
             method: configs['method'] ?? 'GET',
             responseType: ResponseType.stream,
+            extra: {
+              if (connectionPoolKey != null)
+                'connectionPoolKey': connectionPoolKey,
+            },
           ),
         );
 
@@ -201,36 +216,30 @@ abstract class ImageDownloader {
         if (expectedBytes == -1) {
           expectedBytes = null;
         }
-        var buffer = <int>[];
+        final buffer = BytesBuilder(copy: false);
+        var currentBytes = 0;
         await for (var data in stream) {
-          buffer.addAll(data);
+          buffer.add(data);
+          currentBytes += data.length;
           yield ImageDownloadProgress(
-            currentBytes: buffer.length,
+            currentBytes: currentBytes,
             totalBytes: expectedBytes,
           );
         }
 
+        var data = buffer.takeBytes();
+
         if (configs['onResponse'] is JSInvokable) {
-          dynamic result = (configs['onResponse'] as JSInvokable)([
-            Uint8List.fromList(buffer),
-          ]);
+          dynamic result = (configs['onResponse'] as JSInvokable)([data]);
           if (result is Future) {
             result = await result;
           }
           if (result is List<int>) {
-            buffer = result;
+            data = Uint8List.fromList(result);
           } else {
             throw "Error: Invalid onResponse result.";
           }
           (configs['onResponse'] as JSInvokable).free();
-        }
-
-        Uint8List data;
-        if (buffer is Uint8List) {
-          data = buffer;
-        } else {
-          data = Uint8List.fromList(buffer);
-          buffer.clear();
         }
 
         if (configs['modifyImage'] != null) {
@@ -241,7 +250,9 @@ abstract class ImageDownloader {
           data = newData;
         }
 
-        await CacheManager().writeCache(cacheKey, data);
+        if (cacheResult) {
+          await CacheManager().writeCache(cacheKey, data);
+        }
         yield ImageDownloadProgress(
           currentBytes: data.length,
           totalBytes: data.length,
