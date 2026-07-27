@@ -506,6 +506,10 @@ class LocalManager with ChangeNotifier {
 
   List<DownloadTask> downloadingTasks = [];
 
+  Future<void>? _saveDownloadingTasksFuture;
+
+  bool _saveDownloadingTasksRequested = false;
+
   bool isDownloading(String id, ComicType type) {
     return downloadingTasks.any(
       (element) => element.id == id && element.comicType == type,
@@ -606,11 +610,20 @@ class LocalManager with ChangeNotifier {
     }
   }
 
-  Future<void> saveCurrentDownloadingTasks() async {
-    var tasks = downloadingTasks.map((e) => e.toJson()).toList();
-    await File(
-      FilePath.join(App.dataPath, 'downloading_tasks.json'),
-    ).writeAsString(jsonEncode(tasks));
+  Future<void> saveCurrentDownloadingTasks() {
+    _saveDownloadingTasksRequested = true;
+    return _saveDownloadingTasksFuture ??= _writeDownloadingTasks()
+        .whenComplete(() => _saveDownloadingTasksFuture = null);
+  }
+
+  Future<void> _writeDownloadingTasks() async {
+    while (_saveDownloadingTasksRequested) {
+      _saveDownloadingTasksRequested = false;
+      final data = jsonEncode(downloadingTasks.map((e) => e.toJson()).toList());
+      await File(
+        FilePath.join(App.dataPath, 'downloading_tasks.json'),
+      ).writeAsString(data);
+    }
   }
 
   void restoreDownloadingTasks() {

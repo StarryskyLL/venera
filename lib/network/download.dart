@@ -74,6 +74,39 @@ abstract class DownloadTask with ChangeNotifier {
   int get hashCode => Object.hash(id, comicType);
 }
 
+enum ChapterDownloadStatus {
+  waiting,
+  fetching,
+  downloading,
+  paused,
+  completed,
+  error,
+}
+
+class ChapterDownloadProgress {
+  const ChapterDownloadProgress({
+    required this.id,
+    required this.title,
+    required this.current,
+    required this.total,
+    required this.status,
+    this.errorMessage,
+  });
+
+  final String id;
+  final String title;
+  final int current;
+  final int total;
+  final ChapterDownloadStatus status;
+  final String? errorMessage;
+
+  double get progress {
+    if (status == ChapterDownloadStatus.completed) return 1;
+    if (total == 0) return 0;
+    return (current / total).clamp(0, 1).toDouble();
+  }
+}
+
 class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   final ComicSource source;
 
@@ -105,6 +138,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   void cancel() {
     _isRunning = false;
     _runId++;
+    _progressSaveTimer?.cancel();
+    _progressSaveTimer = null;
     LocalManager().removeTask(this);
     var local = LocalManager().find(id, comicType);
     if (path != null) {
@@ -160,6 +195,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       tasks.remove(i);
     }
     stopRecorder();
+    unawaited(_flushProgress());
     notifyListeners();
   }
 
@@ -211,13 +247,17 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   Set<String> _completedChapters = {};
 
+  final Map<String, ChapterDownloadStatus> _chapterStates = {};
+
+  final Map<String, String> _chapterErrors = {};
+
   var tasks = <Object, _ImageDownloadWrapper>{};
 
   int _runId = 0;
 
   Future<void>? _chapterWorkers;
 
-  Future<void> _saveFuture = Future.value();
+  Timer? _progressSaveTimer;
 
   List<String> get _chapterIds {
     final allChapters = comic?.chapters?.ids.toList() ?? const <String>[];
@@ -233,11 +273,53 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   bool _isCurrentRun(int runId) => _isRunning && _runId == runId;
 
-  Future<void> _saveProgress() {
-    _saveFuture = _saveFuture
-        .catchError((Object _, StackTrace __) {})
-        .then((_) => LocalManager().saveCurrentDownloadingTasks());
-    return _saveFuture;
+  bool get hasChapterProgress => comic?.chapters != null;
+
+  List<ChapterDownloadProgress> get chapterDownloadProgress {
+    if (!hasChapterProgress) return const [];
+    return _chapterIds
+        .map((chapterId) {
+          final images = _images?[chapterId];
+          final total = images?.length ?? 0;
+          final current = (_chapterProgress[chapterId] ?? 0)
+              .clamp(0, total)
+              .toInt();
+          return ChapterDownloadProgress(
+            id: chapterId,
+            title: comic!.chapters![chapterId] ?? chapterId,
+            current: current,
+            total: total,
+            status: _chapterStatus(chapterId),
+            errorMessage: _chapterErrors[chapterId],
+          );
+        })
+        .toList(growable: false);
+  }
+
+  ChapterDownloadStatus _chapterStatus(String chapterId) {
+    if (_completedChapters.contains(chapterId)) {
+      return ChapterDownloadStatus.completed;
+    }
+    if (_chapterErrors.containsKey(chapterId)) {
+      return ChapterDownloadStatus.error;
+    }
+    if (!_isRunning) {
+      return ChapterDownloadStatus.paused;
+    }
+    return _chapterStates[chapterId] ?? ChapterDownloadStatus.waiting;
+  }
+
+  void _scheduleProgressSave() {
+    _progressSaveTimer ??= Timer(const Duration(seconds: 1), () {
+      _progressSaveTimer = null;
+      unawaited(LocalManager().saveCurrentDownloadingTasks());
+    });
+  }
+
+  Future<void> _flushProgress() {
+    _progressSaveTimer?.cancel();
+    _progressSaveTimer = null;
+    return LocalManager().saveCurrentDownloadingTasks();
   }
 
   void _scheduleSingleComicTasks(int runId) {
@@ -283,7 +365,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       _index++;
       _downloadedCount++;
       _message = "$_downloadedCount/$_totalCount";
-      await _saveProgress();
+      _scheduleProgressSave();
     }
     await LocalManager().markChapterDownloaded(
       comicId,
@@ -329,6 +411,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         await _downloadChapter(chapterId, runId);
       } catch (e, s) {
         if (_isCurrentRun(runId)) {
+          _chapterStates[chapterId] = ChapterDownloadStatus.error;
+          _chapterErrors[chapterId] = e.toString();
           Log.error("Download", e.toString(), s);
           _setError("Error: $e");
         }
@@ -339,6 +423,11 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   Future<void> _downloadChapter(String chapterId, int runId) async {
     var images = _images![chapterId];
+    _chapterErrors.remove(chapterId);
+    _chapterStates[chapterId] = images == null
+        ? ChapterDownloadStatus.fetching
+        : ChapterDownloadStatus.downloading;
+    notifyListeners();
     if (images == null) {
       final fetchedCount = _chapterIds.where(_images!.containsKey).length;
       _message = "Fetching image list ($fetchedCount/${_chapterIds.length})...";
@@ -357,7 +446,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       images = res.data;
       _images![chapterId] = images;
       _totalCount += images.length;
-      await _saveProgress();
+      _chapterStates[chapterId] = ChapterDownloadStatus.downloading;
+      _scheduleProgressSave();
+      notifyListeners();
       if (!_isCurrentRun(runId)) return;
     }
 
@@ -392,8 +483,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       _chapterProgress[chapterId] = index;
       _downloadedCount++;
       _message = "$_downloadedCount/$_totalCount";
-      notifyListeners();
-      await _saveProgress();
+      _scheduleProgressSave();
     }
 
     _chapterProgress[chapterId] = images.length;
@@ -404,7 +494,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       comicBuilder: toLocalComic,
     );
     _completedChapters.add(chapterId);
-    await _saveProgress();
+    _chapterStates[chapterId] = ChapterDownloadStatus.completed;
+    notifyListeners();
+    await _flushProgress();
   }
 
   @override
@@ -412,6 +504,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     if (_isRunning) return;
     final runId = ++_runId;
     _isError = false;
+    _chapterErrors.clear();
     _message = "Resuming...";
     _isRunning = true;
     notifyListeners();
@@ -457,7 +550,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }
     }
 
-    await _saveProgress();
+    await _flushProgress();
     if (!_isCurrentRun(runId)) return;
 
     if (_cover == null) {
@@ -489,7 +582,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         _cover = res.data;
         notifyListeners();
       }
-      await _saveProgress();
+      await _flushProgress();
       if (!_isCurrentRun(runId)) return;
     }
 
@@ -521,7 +614,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         }
         _message = "$_downloadedCount/$_totalCount";
         notifyListeners();
-        await _saveProgress();
+        await _flushProgress();
         if (!_isCurrentRun(runId)) return;
         isComplete = await _downloadSingleComic(runId);
       } else {
@@ -537,14 +630,16 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
     if (!isComplete || !_isCurrentRun(runId)) return;
     _isRunning = false;
+    _progressSaveTimer?.cancel();
+    _progressSaveTimer = null;
     LocalManager().completeTask(this);
     stopRecorder();
   }
 
   @override
   void onNextSecond(Timer t) {
-    notifyListeners();
     super.onNextSecond(t);
+    notifyListeners();
   }
 
   void _setError(String message) {
@@ -558,6 +653,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }
     }
     tasks.clear();
+    unawaited(_flushProgress());
     notifyListeners();
     stopRecorder();
   }
