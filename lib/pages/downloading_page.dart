@@ -174,85 +174,81 @@ class _DownloadTaskTileState extends State<_DownloadTaskTile> {
     final chapterTask = widget.task is ImagesDownloadTask
         ? widget.task as ImagesDownloadTask
         : null;
-    return Container(
-      height: 136,
-      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-      child: Row(
-        children: [
-          Container(
-            width: 82,
-            height: double.infinity,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
-              color: context.colorScheme.primaryContainer,
+    final canOpenChapterProgress = chapterTask?.hasChapterProgress == true;
+    return InkWell(
+      onTap: canOpenChapterProgress
+          ? () {
+              context.to(
+                () => _ChapterDownloadProgressPage(task: chapterTask!),
+              );
+            }
+          : null,
+      child: Container(
+        height: 136,
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+        child: Row(
+          children: [
+            Container(
+              width: 82,
+              height: double.infinity,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                color: context.colorScheme.primaryContainer,
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: widget.task.cover == null
+                  ? null
+                  : Image(
+                      image: CachedImageProvider(widget.task.cover!),
+                      filterQuality: FilterQuality.medium,
+                      fit: BoxFit.cover,
+                    ),
             ),
-            clipBehavior: Clip.antiAlias,
-            child: widget.task.cover == null
-                ? null
-                : Image(
-                    image: CachedImageProvider(widget.task.cover!),
-                    filterQuality: FilterQuality.medium,
-                    fit: BoxFit.cover,
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          widget.task.title,
+                          style: Theme.of(context).textTheme.bodyMedium,
+                          maxLines: 2,
+                        ),
+                      ),
+                      MenuButton(
+                        entries: [
+                          MenuEntry(
+                            icon: Icons.close,
+                            text: "Cancel".tl,
+                            onClick: () {
+                              widget.task.cancel();
+                            },
+                          ),
+                          MenuEntry(
+                            icon: Icons.vertical_align_top,
+                            text: "Move To First".tl,
+                            onClick: () {
+                              LocalManager().moveToFirst(widget.task);
+                            },
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        widget.task.title,
-                        style: Theme.of(context).textTheme.bodyMedium,
-                        maxLines: 2,
-                      ),
-                    ),
-                    if (chapterTask?.hasChapterProgress == true)
-                      Tooltip(
-                        message: "Chapter Progress".tl,
-                        child: IconButton(
-                          icon: const Icon(Icons.view_list_outlined),
-                          onPressed: () {
-                            context.to(
-                              () => _ChapterDownloadProgressPage(
-                                task: chapterTask!,
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                    MenuButton(
-                      entries: [
-                        MenuEntry(
-                          icon: Icons.close,
-                          text: "Cancel".tl,
-                          onClick: () {
-                            widget.task.cancel();
-                          },
-                        ),
-                        MenuEntry(
-                          icon: Icons.vertical_align_top,
-                          text: "Move To First".tl,
-                          onClick: () {
-                            LocalManager().moveToFirst(widget.task);
-                          },
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-                const Spacer(),
-                if (!widget.task.isPaused || widget.task.isError)
-                  Text(widget.task.message, style: ts.s12, maxLines: 3),
-                const SizedBox(height: 4),
-                LinearProgressIndicator(value: widget.task.progress),
-                const SizedBox(height: 8),
-              ],
+                  const Spacer(),
+                  if (!widget.task.isPaused || widget.task.isError)
+                    Text(widget.task.message, style: ts.s12, maxLines: 3),
+                  const SizedBox(height: 4),
+                  LinearProgressIndicator(value: widget.task.progress),
+                  const SizedBox(height: 8),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -326,8 +322,21 @@ class _ChapterDownloadProgressPageState
                       height: 1,
                       color: context.colorScheme.outlineVariant,
                     ),
-                    itemBuilder: (context, index) =>
-                        _ChapterProgressTile(progress: chapters[index]),
+                    itemBuilder: (context, index) {
+                      final progress = chapters[index];
+                      final canToggle = widget.task.canToggleChapter(
+                        progress.id,
+                      );
+                      return _ChapterProgressTile(
+                        progress: progress,
+                        onTap: canToggle
+                            ? () {
+                                widget.task.toggleChapter(progress.id);
+                                BackgroundDownload.instance.sync();
+                              }
+                            : null,
+                      );
+                    },
                   ),
           ),
           _buildControls(context, isComplete),
@@ -454,51 +463,65 @@ class _ChapterDownloadProgressPageState
 }
 
 class _ChapterProgressTile extends StatelessWidget {
-  const _ChapterProgressTile({required this.progress});
+  const _ChapterProgressTile({required this.progress, this.onTap});
 
   final ChapterDownloadProgress progress;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     final statusColor = _statusColor(context);
     final totalText = progress.total == 0 ? "--" : progress.total.toString();
-    return ConstrainedBox(
-      constraints: const BoxConstraints(minHeight: 104),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  child: Text(
-                    progress.title,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.titleMedium,
+    return InkWell(
+      onTap: onTap,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(minHeight: 104),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Text(
+                      progress.title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
                   ),
-                ),
-                const SizedBox(width: 12),
-                Text(
-                  "${progress.current}/$totalText",
-                  style: ts.s14.bold.copyWith(
-                    color: context.colorScheme.onSurfaceVariant,
+                  const SizedBox(width: 12),
+                  if (onTap != null) ...[
+                    Icon(
+                      progress.status == ChapterDownloadStatus.paused
+                          ? Icons.play_arrow
+                          : Icons.pause,
+                      size: 18,
+                      color: context.colorScheme.primary,
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  Text(
+                    "${progress.current}/$totalText",
+                    style: ts.s14.bold.copyWith(
+                      color: context.colorScheme.onSurfaceVariant,
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            Text(
-              _statusText(),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: ts.s12.copyWith(color: statusColor),
-            ),
-            const SizedBox(height: 8),
-            _buildProgressIndicator(),
-          ],
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _statusText(),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: ts.s12.copyWith(color: statusColor),
+              ),
+              const SizedBox(height: 8),
+              _buildProgressIndicator(),
+            ],
+          ),
         ),
       ),
     );

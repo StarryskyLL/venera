@@ -139,6 +139,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   void cancel() {
     _isRunning = false;
     _runId++;
+    _chapterQueue?.close();
+    _cancelChapterPauseSignals();
     _progressNotifyTimer?.cancel();
     _progressNotifyTimer = null;
     _progressSaveTimer?.cancel();
@@ -185,6 +187,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
     _isRunning = false;
     _runId++;
+    _chapterQueue?.close();
+    _cancelChapterPauseSignals();
     _message = "Paused";
     _currentSpeed = 0;
     _progressNotifyTimer?.cancel();
@@ -252,6 +256,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   Set<String> _completedChapters = {};
 
+  Set<String> _pausedChapters = {};
+
   final Map<String, ChapterDownloadStatus> _chapterStates = {};
 
   final Map<String, String> _chapterErrors = {};
@@ -261,6 +267,12 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   int _runId = 0;
 
   Future<void>? _chapterWorkers;
+
+  ChapterDownloadQueue? _chapterQueue;
+
+  final Map<String, Completer<void>> _chapterPauseSignals = {};
+
+  final List<String> _chapterResumePriority = [];
 
   Timer? _progressSaveTimer;
 
@@ -287,7 +299,27 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   bool _isCurrentRun(int runId) => _isRunning && _runId == runId;
 
+  bool _isChapterDownloadActive(String chapterId, int runId) {
+    return _isCurrentRun(runId) && !_pausedChapters.contains(chapterId);
+  }
+
   bool get hasChapterProgress => comic?.chapters != null;
+
+  bool canToggleChapter(String chapterId) {
+    return _isRunning &&
+        !_isError &&
+        _chapterIds.contains(chapterId) &&
+        !_completedChapters.contains(chapterId);
+  }
+
+  void toggleChapter(String chapterId) {
+    if (!canToggleChapter(chapterId)) return;
+    if (_pausedChapters.contains(chapterId)) {
+      _resumeChapter(chapterId);
+    } else {
+      _pauseChapter(chapterId);
+    }
+  }
 
   List<ChapterDownloadProgress> get chapterDownloadProgress {
     if (!hasChapterProgress) return const [];
@@ -317,10 +349,62 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     if (_chapterErrors.containsKey(chapterId)) {
       return ChapterDownloadStatus.error;
     }
+    if (_pausedChapters.contains(chapterId)) {
+      return ChapterDownloadStatus.paused;
+    }
     if (!_isRunning) {
       return ChapterDownloadStatus.paused;
     }
     return _chapterStates[chapterId] ?? ChapterDownloadStatus.waiting;
+  }
+
+  void _pauseChapter(String chapterId) {
+    final queue = _chapterQueue;
+    if (queue == null) {
+      _pausedChapters.add(chapterId);
+    } else {
+      queue.pause(chapterId);
+    }
+    _chapterResumePriority.remove(chapterId);
+    _chapterStates[chapterId] = ChapterDownloadStatus.paused;
+
+    final signal = _chapterPauseSignals[chapterId];
+    if (signal != null && !signal.isCompleted) {
+      signal.complete();
+    }
+    final activeTasks = tasks.entries
+        .where((entry) => entry.value.chapter == chapterId)
+        .toList(growable: false);
+    for (final entry in activeTasks) {
+      entry.value.cancel();
+      if (identical(tasks[entry.key], entry.value)) {
+        tasks.remove(entry.key);
+      }
+    }
+
+    _scheduleProgressSave();
+    notifyListeners();
+  }
+
+  void _resumeChapter(String chapterId) {
+    final queue = _chapterQueue;
+    if (queue == null) {
+      _pausedChapters.remove(chapterId);
+      _chapterResumePriority.remove(chapterId);
+      _chapterResumePriority.insert(0, chapterId);
+    } else {
+      queue.resume(chapterId);
+    }
+    _chapterStates[chapterId] = ChapterDownloadStatus.waiting;
+    _scheduleProgressSave();
+    notifyListeners();
+  }
+
+  void _cancelChapterPauseSignals() {
+    for (final signal in _chapterPauseSignals.values) {
+      if (!signal.isCompleted) signal.complete();
+    }
+    _chapterPauseSignals.clear();
   }
 
   void _scheduleProgressSave() {
@@ -407,9 +491,21 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
 
     _images ??= {};
-    final queue = ChapterDownloadQueue(_chapterIds, _completedChapters);
+    final queue = ChapterDownloadQueue(
+      _chapterIds,
+      _completedChapters,
+      paused: _pausedChapters,
+      priority: _chapterResumePriority,
+    );
+    _chapterResumePriority.clear();
+    _chapterQueue = queue;
     final pendingCount = queue.pendingCount;
-    if (pendingCount == 0) return true;
+    if (pendingCount == 0) {
+      if (identical(_chapterQueue, queue)) {
+        _chapterQueue = null;
+      }
+      return true;
+    }
 
     final workerCount = pendingCount < _maxConcurrentTasks
         ? pendingCount
@@ -425,6 +521,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     if (identical(_chapterWorkers, workers)) {
       _chapterWorkers = null;
     }
+    if (identical(_chapterQueue, queue)) {
+      _chapterQueue = null;
+    }
     return _isCurrentRun(runId) &&
         _chapterIds.every(_completedChapters.contains);
   }
@@ -435,7 +534,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     int workerIndex,
   ) async {
     while (_isCurrentRun(runId)) {
-      final chapterId = queue.takeNext();
+      final chapterId = await queue.waitNext();
       if (chapterId == null) return;
       try {
         await _downloadChapter(chapterId, runId, workerIndex);
@@ -447,6 +546,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
           _setError("Error: $e");
         }
         return;
+      } finally {
+        queue.release(chapterId);
       }
     }
   }
@@ -455,6 +556,24 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     String chapterId,
     int runId,
     int workerIndex,
+  ) async {
+    if (!_isChapterDownloadActive(chapterId, runId)) return;
+    final pauseSignal = Completer<void>();
+    _chapterPauseSignals[chapterId] = pauseSignal;
+    try {
+      await _downloadChapterBody(chapterId, runId, workerIndex, pauseSignal);
+    } finally {
+      if (identical(_chapterPauseSignals[chapterId], pauseSignal)) {
+        _chapterPauseSignals.remove(chapterId);
+      }
+    }
+  }
+
+  Future<void> _downloadChapterBody(
+    String chapterId,
+    int runId,
+    int workerIndex,
+    Completer<void> pauseSignal,
   ) async {
     var images = _images![chapterId];
     _chapterErrors.remove(chapterId);
@@ -466,14 +585,17 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       final fetchedCount = _chapterIds.where(_images!.containsKey).length;
       _message = "Fetching image list ($fetchedCount/${_chapterIds.length})...";
       notifyListeners();
-      final res = await _runWithRetry(() async {
-        final result = await source.loadComicPages!(comicId, chapterId);
-        if (result.error) {
-          throw result.errorMessage!;
-        }
-        return result.data;
-      });
-      if (!_isCurrentRun(runId)) return;
+      final res = await Future.any<Res<List<String>>?>([
+        _runWithRetry<List<String>>(() async {
+          final result = await source.loadComicPages!(comicId, chapterId);
+          if (result.error) {
+            throw result.errorMessage!;
+          }
+          return result.data;
+        }),
+        pauseSignal.future.then<Res<List<String>>?>((_) => null),
+      ]);
+      if (res == null || !_isChapterDownloadActive(chapterId, runId)) return;
       if (res.error) {
         throw res.errorMessage!;
       }
@@ -529,7 +651,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       if (identical(tasks[taskKey], task)) {
         tasks.remove(taskKey);
       }
-      if (!_isCurrentRun(runId)) return;
+      if (task.isCancelled || !_isChapterDownloadActive(chapterId, runId)) {
+        return;
+      }
       if (task.error != null) {
         throw task.error!;
       }
@@ -552,6 +676,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       comicBuilder: toLocalComic,
     );
     _completedChapters.add(chapterId);
+    _pausedChapters.remove(chapterId);
+    _chapterResumePriority.remove(chapterId);
     _chapterStates[chapterId] = ChapterDownloadStatus.completed;
     notifyListeners();
     await _flushProgress();
@@ -563,6 +689,12 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     final runId = ++_runId;
     _isError = false;
     _chapterErrors.clear();
+    for (final chapterId in _chapterIds) {
+      if (!_completedChapters.contains(chapterId) &&
+          !_pausedChapters.contains(chapterId)) {
+        _chapterStates[chapterId] = ChapterDownloadStatus.waiting;
+      }
+    }
     _message = "Resuming...";
     _isRunning = true;
     notifyListeners();
@@ -705,6 +837,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   void _setError(String message) {
     _isRunning = false;
     _runId++;
+    _chapterQueue?.close();
+    _cancelChapterPauseSignals();
     _isError = true;
     _message = message;
     _progressNotifyTimer?.cancel();
@@ -743,6 +877,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       "chapter": _chapter,
       "chapterProgress": _chapterProgress,
       "completedChapters": _completedChapters.toList(),
+      "pausedChapters": _pausedChapters.toList(),
     };
   }
 
@@ -787,6 +922,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     task._completedChapters = Set<String>.from(
       json["completedChapters"] as List? ?? const [],
     );
+    task._pausedChapters = Set<String>.from(
+      json["pausedChapters"] as List? ?? const [],
+    )..removeAll(task._completedChapters);
     task._restoreLegacyChapterProgress(json);
     return task;
   }
