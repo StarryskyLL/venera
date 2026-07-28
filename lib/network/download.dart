@@ -139,6 +139,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   void cancel() {
     _isRunning = false;
     _runId++;
+    _progressNotifyTimer?.cancel();
+    _progressNotifyTimer = null;
     _progressSaveTimer?.cancel();
     _progressSaveTimer = null;
     LocalManager().removeTask(this);
@@ -185,6 +187,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     _runId++;
     _message = "Paused";
     _currentSpeed = 0;
+    _progressNotifyTimer?.cancel();
+    _progressNotifyTimer = null;
     var shouldMove = <Object>[];
     for (var entry in tasks.entries) {
       if (!entry.value.isComplete) {
@@ -260,6 +264,10 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   Timer? _progressSaveTimer;
 
+  Timer? _progressNotifyTimer;
+
+  static const _progressNotifyInterval = Duration(milliseconds: 50);
+
   List<String> get _chapterIds {
     final allChapters = comic?.chapters?.ids.toList() ?? const <String>[];
     if (chapters == null) return allChapters;
@@ -328,6 +336,14 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     return LocalManager().saveCurrentDownloadingTasks();
   }
 
+  void _notifyProgressChanged() {
+    if (_progressNotifyTimer != null) return;
+    _progressNotifyTimer = Timer(_progressNotifyInterval, () {
+      _progressNotifyTimer = null;
+      notifyListeners();
+    });
+  }
+
   void _scheduleSingleComicTasks(int runId) {
     var images = _images!['']!;
     var downloading = 0;
@@ -372,6 +388,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       _downloadedCount++;
       _message = "$_downloadedCount/$_totalCount";
       _scheduleProgressSave();
+      _notifyProgressChanged();
     }
     await LocalManager().markChapterDownloaded(
       comicId,
@@ -522,6 +539,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         _downloadedCount += completion.advanced;
         _message = "$_downloadedCount/$_totalCount";
         _scheduleProgressSave();
+        _notifyProgressChanged();
       }
       scheduleImages();
     }
@@ -670,6 +688,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
     if (!isComplete || !_isCurrentRun(runId)) return;
     _isRunning = false;
+    _progressNotifyTimer?.cancel();
+    _progressNotifyTimer = null;
     _progressSaveTimer?.cancel();
     _progressSaveTimer = null;
     LocalManager().completeTask(this);
@@ -687,6 +707,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     _runId++;
     _isError = true;
     _message = message;
+    _progressNotifyTimer?.cancel();
+    _progressNotifyTimer = null;
     for (final task in tasks.values) {
       if (!task.isComplete) {
         task.cancel();

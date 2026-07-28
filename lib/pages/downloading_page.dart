@@ -270,6 +270,8 @@ class _ChapterDownloadProgressPage extends StatefulWidget {
 
 class _ChapterDownloadProgressPageState
     extends State<_ChapterDownloadProgressPage> {
+  bool _rebuildScheduled = false;
+
   @override
   void initState() {
     super.initState();
@@ -285,7 +287,12 @@ class _ChapterDownloadProgressPageState
   }
 
   void _update() {
-    if (mounted) setState(() {});
+    if (!mounted || _rebuildScheduled) return;
+    _rebuildScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _rebuildScheduled = false;
+      if (mounted) setState(() {});
+    });
   }
 
   @override
@@ -490,15 +497,28 @@ class _ChapterProgressTile extends StatelessWidget {
               style: ts.s12.copyWith(color: statusColor),
             ),
             const SizedBox(height: 8),
-            LinearProgressIndicator(
-              value: progress.status == ChapterDownloadStatus.fetching
-                  ? null
-                  : progress.progress,
-              minHeight: 4,
-              borderRadius: BorderRadius.circular(2),
-            ),
+            _buildProgressIndicator(),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildProgressIndicator() {
+    if (progress.status == ChapterDownloadStatus.fetching) {
+      return LinearProgressIndicator(
+        minHeight: 4,
+        borderRadius: BorderRadius.circular(2),
+      );
+    }
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: progress.progress),
+      duration: const Duration(milliseconds: 160),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) => LinearProgressIndicator(
+        value: value,
+        minHeight: 4,
+        borderRadius: BorderRadius.circular(2),
       ),
     );
   }

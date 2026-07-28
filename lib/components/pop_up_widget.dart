@@ -5,6 +5,8 @@ class PopUpWidget<T> extends PopupRoute<T> {
 
   final Widget widget;
 
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
   @override
   Color? get barrierColor => Colors.black54;
 
@@ -23,6 +25,7 @@ class PopUpWidget<T> extends PopupRoute<T> {
     var height = MediaQuery.of(context).size.height * 0.9;
     bool showPopUp = MediaQuery.of(context).size.width > 500;
     Widget body = PopupIndicatorWidget(
+      navigatorKey: _navigatorKey,
       child: Container(
         decoration: showPopUp
             ? BoxDecoration(
@@ -42,16 +45,22 @@ class PopUpWidget<T> extends PopupRoute<T> {
         width: showPopUp ? 500 : double.infinity,
         height: showPopUp ? height : double.infinity,
         child: ClipRect(
-          child: Navigator(
-            onGenerateRoute: (settings) =>
-                MaterialPageRoute(builder: (context) => widget),
+          child: NavigatorPopHandler(
+            onPopWithResult: (result) {
+              _navigatorKey.currentState?.pop(result);
+            },
+            child: Navigator(
+              key: _navigatorKey,
+              onGenerateRoute: (settings) =>
+                  MaterialPageRoute(builder: (context) => widget),
+            ),
           ),
         ),
       ),
     );
     if (App.isIOS) {
       body = IOSBackGestureDetector(
-        enabledCallback: () => true,
+        enabledCallback: () => !(_navigatorKey.currentState?.canPop() ?? false),
         gestureWidth: 20.0,
         onStartPopGesture: () =>
             IOSBackGestureController(controller!, navigator!),
@@ -88,7 +97,13 @@ class PopUpWidget<T> extends PopupRoute<T> {
 }
 
 class PopupIndicatorWidget extends InheritedWidget {
-  const PopupIndicatorWidget({super.key, required super.child});
+  const PopupIndicatorWidget({
+    super.key,
+    required this.navigatorKey,
+    required super.child,
+  });
+
+  final GlobalKey<NavigatorState> navigatorKey;
 
   @override
   bool updateShouldNotify(covariant InheritedWidget oldWidget) => false;
@@ -145,8 +160,16 @@ class _PopUpWidgetScaffoldState extends State<PopUpWidgetScaffold> {
                   message: "Back".tl,
                   child: IconButton(
                     icon: const Icon(Icons.arrow_back_sharp),
-                    onPressed: () =>
-                        context.canPop() ? context.pop() : App.pop(),
+                    onPressed: () {
+                      final navigator = PopupIndicatorWidget.maybeOf(
+                        context,
+                      )?.navigatorKey.currentState;
+                      if (navigator?.canPop() ?? false) {
+                        navigator!.pop();
+                      } else {
+                        App.pop();
+                      }
+                    },
                   ),
                 ),
                 const SizedBox(width: 16),
