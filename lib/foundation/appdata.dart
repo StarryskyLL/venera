@@ -242,6 +242,7 @@ class Settings with ChangeNotifier {
     'language': 'system', // system, zh-CN, zh-TW, en-US
     'cacheSize': 2048, // in MB
     'downloadThreads': 5,
+    'chapterDownloadThreads': 2,
     'enableLongPressToZoom': true,
     'longPressZoomPosition': "press", // press, center
     'checkUpdateOnStart': false,

@@ -17,6 +17,7 @@ import 'package:venera/utils/io.dart';
 import 'package:zip_flutter/zip_flutter.dart';
 
 import 'chapter_download_queue.dart';
+import 'concurrent_index_queue.dart';
 import 'file_downloader.dart';
 
 abstract class DownloadTask with ChangeNotifier {
@@ -271,6 +272,11 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     return value < 1 ? 1 : value;
   }
 
+  int get _maxConcurrentImagesPerChapter {
+    final value = (appdata.settings["chapterDownloadThreads"] as num).toInt();
+    return value.clamp(1, 10).toInt();
+  }
+
   bool _isCurrentRun(int runId) => _isRunning && _runId == runId;
 
   bool get hasChapterProgress => comic?.chapters != null;
@@ -470,32 +476,54 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       saveTo.createSync(recursive: true);
     }
 
-    var index = (_chapterProgress[chapterId] ?? 0)
+    final startIndex = (_chapterProgress[chapterId] ?? 0)
         .clamp(0, images.length)
         .toInt();
-    while (index < images.length) {
-      final task = _ImageDownloadWrapper(
-        this,
-        chapterId,
-        images[index],
-        saveTo,
-        index,
-        connectionPoolKey: 'download-worker-$workerIndex',
-      );
-      tasks[chapterId] = task;
-      await task.wait();
-      if (identical(tasks[chapterId], task)) {
-        tasks.remove(chapterId);
+    final queue = ConcurrentIndexQueue(
+      start: startIndex,
+      endExclusive: images.length,
+      concurrency: _maxConcurrentImagesPerChapter,
+    );
+    final active = <int, Future<_ImageDownloadWrapper>>{};
+
+    void scheduleImages() {
+      ConcurrentIndexSlot? slot;
+      while ((slot = queue.takeNext()) != null) {
+        final currentSlot = slot!;
+        final task = _ImageDownloadWrapper(
+          this,
+          chapterId,
+          images![currentSlot.index],
+          saveTo,
+          currentSlot.index,
+          connectionPoolKey:
+              'download-worker-$workerIndex-image-${currentSlot.lane}',
+        );
+        active[currentSlot.index] = task.wait();
+        tasks[(chapterId, currentSlot.index)] = task;
+      }
+    }
+
+    scheduleImages();
+    while (active.isNotEmpty) {
+      final task = await Future.any(active.values);
+      active.remove(task.index);
+      final taskKey = (chapterId, task.index);
+      if (identical(tasks[taskKey], task)) {
+        tasks.remove(taskKey);
       }
       if (!_isCurrentRun(runId)) return;
       if (task.error != null) {
         throw task.error!;
       }
-      index++;
-      _chapterProgress[chapterId] = index;
-      _downloadedCount++;
-      _message = "$_downloadedCount/$_totalCount";
-      _scheduleProgressSave();
+      final completion = queue.complete(task.index);
+      if (completion.advanced > 0) {
+        _chapterProgress[chapterId] = completion.committedThrough;
+        _downloadedCount += completion.advanced;
+        _message = "$_downloadedCount/$_totalCount";
+        _scheduleProgressSave();
+      }
+      scheduleImages();
     }
 
     _chapterProgress[chapterId] = images.length;

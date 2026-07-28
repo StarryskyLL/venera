@@ -32,6 +32,13 @@ class _NetworkSettingsState extends State<NetworkSettings> {
           min: 1,
           max: 16,
         ).toSliver(),
+        _SliderSetting(
+          title: "Concurrent Images Per Chapter".tl,
+          settingsIndex: 'chapterDownloadThreads',
+          interval: 1,
+          min: 1,
+          max: 10,
+        ).toSliver(),
       ],
     );
   }
